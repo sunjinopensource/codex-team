@@ -96,18 +96,25 @@ function buildAuthorizeUrl(state: string, redirectUri: string, pkce: PkceCodes):
   return `${CODEX_AUTH_BASE_URL}/oauth/authorize?${params.toString()}`;
 }
 
+const WINDOWS_CMD_METACHARACTERS = /[\^&|<>%]/g;
+
+function escapeCmdArgument(value: string): string {
+  return value.replace(WINDOWS_CMD_METACHARACTERS, "^$&");
+}
+
 function openBrowser(
   url: string,
   onError: BrowserOpenErrorHandler = () => undefined,
   spawnImpl: SpawnLike = spawn,
 ): void {
-  const command =
-    process.platform === "darwin"
-      ? "open"
-      : process.platform === "win32"
-        ? "cmd"
-        : "xdg-open";
-  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  const isWindows = process.platform === "win32";
+  const command = isWindows ? "cmd" : process.platform === "darwin" ? "open" : "xdg-open";
+  // cmd.exe treats "&" as a command separator and Node only quotes arguments
+  // that contain whitespace, so an unescaped authorize URL is cut at the first
+  // "&": the browser loads a URL without client_id and OpenAI answers with
+  // missing_required_parameter. Escape cmd metacharacters instead of relying
+  // on quotes, which cmd's own argument parsing swallows.
+  const args = isWindows ? ["/c", "start", "", escapeCmdArgument(url)] : [url];
   const child = spawnImpl(command, args, {
     detached: true,
     stdio: "ignore",

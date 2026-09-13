@@ -96,6 +96,56 @@ describe("Codex login provider", () => {
     expect(stderr.read()).toContain("Failed to open browser automatically: spawn xdg-open ENOENT");
   });
 
+  test("escapes the authorize URL on Windows so cmd keeps the whole query string", async () => {
+    const auth = createAuthPayload("acct-browser-windows", "chatgpt", "plus", "user-browser-windows");
+    const child = new EventEmitter() as EventEmitter & { unref: () => void };
+    child.unref = () => undefined;
+
+    const spawnCalls: Array<{ command: string; args?: readonly string[] }> = [];
+    const spawnMock: typeof spawn = ((command: string, args?: readonly string[]) => {
+      spawnCalls.push({ command, args });
+      return child as ReturnType<typeof spawn>;
+    }) as unknown as typeof spawn;
+
+    const fetchMock: typeof fetch = async (input) => {
+      if (String(input).endsWith("/oauth/token")) {
+        return jsonResponse({
+          id_token: auth.tokens?.id_token,
+          access_token: auth.tokens?.access_token,
+          refresh_token: auth.tokens?.refresh_token,
+        });
+      }
+
+      throw new Error(`Unexpected URL: ${String(input)}`);
+    };
+
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      await createCodexLoginProvider(fetchMock, {
+        spawnImpl: spawnMock,
+        waitForBrowserCallback: async (state) => ({
+          result: { code: "browser-authorization-code", state },
+          redirectUri: "http://localhost:1455/auth/callback",
+        }),
+      }).login({
+        mode: "browser",
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+    } finally {
+      Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    }
+
+    expect(spawnCalls[0]?.command).toBe("cmd");
+    const openedUrl = spawnCalls[0]?.args?.at(-1) ?? "";
+    expect(openedUrl.startsWith("https://auth.openai.com/oauth/authorize?")).toBe(true);
+    expect(openedUrl).toContain("^&client_id=app_EMoamEEZ73f0CkXaXp7hrann");
+    const unescapedUrl = openedUrl.replace(/\^(.)/g, "$1");
+    expect(unescapedUrl).toContain("&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback");
+    expect(unescapedUrl).toContain("&code_challenge_method=S256");
+  });
+
   test("completes device login using Codex device endpoints", async () => {
     const auth = createAuthPayload("acct-device-provider", "chatgpt", "plus", "user-device-provider");
     const requests: Array<{ url: string; body: string }> = [];
