@@ -670,8 +670,10 @@ export async function runCli(
         return await handleUiCommand({
           store,
           stdout: streams.stdout,
+          desktopLauncher,
           portOption: parsed.optionValues.get("--port") ?? null,
           noOpen: parsed.flags.has("--no-open"),
+          tray: parsed.flags.has("--tray"),
           debugLog,
         });
       }

@@ -90,6 +90,31 @@ export function isOnlyManagedDesktopInstanceRunning(
   );
 }
 
+/**
+ * Whether the Desktop that codexm started is still running.
+ *
+ * Codex Desktop is an Electron app: one "instance" shows up as several same-named
+ * processes (main, renderers, helpers). Counting processes is therefore wrong —
+ * what matters is whether the pid codexm recorded is among them. The remote
+ * debugging port is deliberately not part of the check because Windows launches
+ * do not carry it.
+ */
+export function isManagedDesktopInstanceRunning(
+  runningApps: RunningCodexDesktop[],
+  managedState: ManagedCodexDesktopState | null,
+  platform: CodexmPlatform = "darwin",
+): boolean {
+  if (!managedState) {
+    return false;
+  }
+
+  return runningApps.some(
+    (app) =>
+      app.pid === managedState.pid &&
+      isRunningDesktopFromApp(app, managedState.app_path, platform),
+  );
+}
+
 export async function resolveManagedDesktopState(
   desktopLauncher: CodexDesktopLauncher,
   appPath: string,
@@ -133,6 +158,108 @@ export async function resolveManagedDesktopState(
   }
 
   return null;
+}
+
+export const WINDOWS_DESKTOP_NO_DEVTOOLS_WARNING =
+  "Codex Desktop on Windows ignores --remote-debugging-port, so codexm launched it without managed-session tracking.";
+export const DESKTOP_SURFACE_REFRESH_FAILED_WARNING =
+  "Codex Desktop launched, but codexm could not refresh the in-app account surface yet.";
+
+export type ManagedDesktopRestartOutcome =
+  | "relaunched"
+  | "started"
+  | "other-running"
+  | "not-installed"
+  | "unsupported-platform"
+  | "inside-desktop";
+
+/**
+ * Quits a codexm-managed Desktop and starts it again so the app picks up the
+ * current auth snapshot. This is the "restart the app" path for surfaces that
+ * cannot ask for confirmation (console, tray): a Desktop codexm did not start
+ * is never killed, because that could discard unsaved work.
+ */
+export const DESKTOP_FORCE_QUIT_WARNING =
+  "Codex Desktop did not respond to a graceful quit; it was force-closed.";
+
+export async function restartManagedDesktopSession(options: {
+  desktopLauncher: CodexDesktopLauncher;
+  platform: CodexmPlatform;
+  desktopApiBaseUrl?: string | null;
+  /**
+   * Allow quitting a Desktop codexm did not start. Callers must confirm first:
+   * closing an app the operator launched by hand can discard unsaved work.
+   */
+  allowNonManaged?: boolean;
+}): Promise<{
+  outcome: ManagedDesktopRestartOutcome;
+  warnings: string[];
+  requiresConfirmation: boolean;
+}> {
+  const { desktopLauncher, platform } = options;
+  const warnings: string[] = [];
+
+  if (platform === "wsl" || platform === "linux") {
+    return { outcome: "unsupported-platform", warnings, requiresConfirmation: false };
+  }
+
+  // Restarting from inside the app would terminate the surface driving it.
+  if (await desktopLauncher.isRunningInsideDesktopShell()) {
+    return { outcome: "inside-desktop", warnings, requiresConfirmation: false };
+  }
+
+  const appPath = await desktopLauncher.findInstalledApp();
+  if (!appPath) {
+    return { outcome: "not-installed", warnings, requiresConfirmation: false };
+  }
+
+  const runningApps = await desktopLauncher.listRunningApps();
+  if (runningApps.length > 0) {
+    const managedState = await desktopLauncher.readManagedState();
+    if (
+      !isManagedDesktopInstanceRunning(runningApps, managedState, platform) &&
+      options.allowNonManaged !== true
+    ) {
+      return { outcome: "other-running", warnings, requiresConfirmation: true };
+    }
+
+    try {
+      await desktopLauncher.quitRunningApps({ force: false });
+    } catch {
+      // The operator already agreed to close it. A Desktop that ignores the
+      // graceful close (unsaved-session prompt, modal dialog) must not leave
+      // the restart half-done: closed, but never launched again.
+      await desktopLauncher.quitRunningApps({ force: true });
+      warnings.push(DESKTOP_FORCE_QUIT_WARNING);
+    }
+  }
+
+  if (platform === "win32") {
+    await desktopLauncher.launch(appPath, { apiBaseUrl: options.desktopApiBaseUrl });
+    warnings.push(WINDOWS_DESKTOP_NO_DEVTOOLS_WARNING);
+    return {
+      outcome: runningApps.length > 0 ? "relaunched" : "started",
+      warnings,
+      requiresConfirmation: false,
+    };
+  }
+
+  const { refreshedAccountSurface } = await launchManagedDesktopSession({
+    desktopLauncher,
+    appPath,
+    existingApps: runningApps,
+    platform,
+    desktopApiBaseUrl: options.desktopApiBaseUrl,
+  });
+  if (!refreshedAccountSurface) {
+    warnings.push(DESKTOP_SURFACE_REFRESH_FAILED_WARNING);
+  }
+
+  return {
+    outcome: runningApps.length > 0 ? "relaunched" : "started",
+    warnings,
+    requiresConfirmation: false,
+  };
 }
 
 export async function launchManagedDesktopSession(options: {

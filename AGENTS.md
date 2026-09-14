@@ -27,6 +27,7 @@ Detailed design notes live in `docs/internal/`.
 - `src/plan-quota-profile.ts`: centralized plan normalization and quota ratio rules.
 - `src/cli/quota.ts`: quota presentation, list ordering, and auto-switch candidate formatting.
 - `src/cli/quota-display.ts`: shared list and dashboard emphasis, color, and truncation rules.
+- `src/tray/*`: system-tray host for the console (Windows PowerShell NotifyIcon child process); non-Windows platforms fall back to the plain console.
 
 ## Runtime Path Rules
 

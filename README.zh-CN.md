@@ -229,7 +229,14 @@ codexm remote sync            # 只上传比 registry 上更新的账号
 ```bash
 codexm ui                     # 打开 http://127.0.0.1:<port>/?token=...
 codexm ui --port 8899 --no-open
+codexm ui --tray              # 不打开标签页，改为常驻 Windows 系统托盘
 ```
+
+`--tray` 会让控制台常驻 Windows 系统托盘：左键打开控制台，右键可以选择刷新配额、同步到 registry 或退出。macOS 与 Linux 上会自动退回普通模式。
+
+在控制台里切换账号与 `codexm switch` 行为一致：先切换本地 auth，再就地刷新由 `codexm launch` 启动的 Desktop。不是 codexm 启动的 Codex Desktop 会保留原来的登录态，控制台只给出警告而不会去重启它。开启代理模式时，切换只改动代理上游，请求立即走新账号，不会再尝试刷新 Desktop。
+
+如果你要的是真正重启应用而不是就地刷新，用控制台顶部的「重启桌面端」（托盘右键菜单里也有）：它会退出 Codex Desktop 再重新拉起，让应用重新读取当前 auth。运行中的 Desktop 不是 `codexm launch` 启动的时，控制台会先弹确认——关闭它可能丢失未保存的会话；托盘菜单则把「点击」本身视为确认。
 
 ## Shell Completion
 

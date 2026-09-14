@@ -239,10 +239,10 @@
     },
     {
       "name": "ui",
-      "flags": ["--port", "--no-open"],
-      "helpUsages": ["codexm ui [--port <port>] [--no-open]"],
+      "flags": ["--port", "--no-open", "--tray"],
+      "helpUsages": ["codexm ui [--port <port>] [--no-open] [--tray]"],
       "usageErrors": {
-        "default": "codexm ui [--port <port>] [--no-open]"
+        "default": "codexm ui [--port <port>] [--no-open] [--tray]"
       }
     },
     {

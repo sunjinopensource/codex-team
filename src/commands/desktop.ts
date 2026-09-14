@@ -5,6 +5,8 @@ import type { CodexDesktopLauncher } from "../desktop/launcher.js";
 import { writeJson } from "../cli/output.js";
 import { getUsage } from "../cli/spec.js";
 import {
+  DESKTOP_SURFACE_REFRESH_FAILED_WARNING,
+  WINDOWS_DESKTOP_NO_DEVTOOLS_WARNING,
   confirmDesktopRelaunch,
   isOnlyManagedDesktopInstanceRunning,
   launchManagedDesktopSession,
@@ -134,9 +136,7 @@ export async function handleLaunchCommand(options: {
       // no DevTools session to track. Launching (or relaunching) the app is
       // what applies the current auth snapshot.
       await desktopLauncher.launch(appPath, { apiBaseUrl: desktopApiBaseUrl });
-      warnings.push(
-        "Codex Desktop on Windows ignores --remote-debugging-port, so codexm launched it without managed-session tracking.",
-      );
+      warnings.push(WINDOWS_DESKTOP_NO_DEVTOOLS_WARNING);
       return;
     }
 
@@ -151,9 +151,7 @@ export async function handleLaunchCommand(options: {
       `launch: recorded managed desktop pid=${managedState.pid} port=${managedState.remote_debugging_port}`,
     );
     if (!refreshedAccountSurface) {
-      warnings.push(
-        "Codex Desktop launched, but codexm could not refresh the in-app account surface yet.",
-      );
+      warnings.push(DESKTOP_SURFACE_REFRESH_FAILED_WARNING);
     }
   };
 
