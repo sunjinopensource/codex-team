@@ -15,6 +15,7 @@ import {
   createCodexDirectClient,
   type CodexDirectClient,
 } from "../codex-direct-client.js";
+import type { CodexmPlatform } from "../platform.js";
 import {
   createDefaultWebSocket,
   evaluateDevtoolsExpression,
@@ -104,7 +105,10 @@ export function createCodexDesktopLauncher(options: {
   watchReconnectDelayMs?: number;
   watchHealthCheckIntervalMs?: number;
   watchHealthCheckTimeoutMs?: number;
+  /** Platform used for binary paths and launch mechanics. Defaults to darwin. */
+  platform?: CodexmPlatform;
 } = {}): CodexDesktopLauncher {
+  const platform = options.platform ?? "darwin";
   const execFileImpl = options.execFileImpl ?? execFile;
   const statePath = options.statePath ?? DEFAULT_CODEX_DESKTOP_STATE_PATH;
   const readFileImpl = options.readFileImpl ?? (async (path: string) => readFile(path, "utf8"));
@@ -123,7 +127,11 @@ export function createCodexDesktopLauncher(options: {
   const quitRunningApps = (quitOptions?: { force?: boolean }) =>
     quitRunningDesktopApps(execFileImpl, quitOptions);
   const launch = (appPath: string, launchOptions?: { apiBaseUrl?: string | null }) =>
-    launchDesktopApp(launchProcessImpl, appPath, launchOptions);
+    launchDesktopApp(
+      (processOptions) => launchProcessImpl({ ...processOptions, platform }),
+      appPath,
+      { ...(launchOptions ?? {}), platform },
+    );
   const activateApp = (appPath: string) => activateDesktopApp(execFileImpl, appPath);
   const isInsideDesktopShell = () => isRunningInsideDesktopShell(execFileImpl);
 
@@ -159,7 +167,7 @@ export function createCodexDesktopLauncher(options: {
       }
 
       const runningApps = await listRunningApps();
-      if (!isManagedDesktopProcess(runningApps, state)) {
+      if (!isManagedDesktopProcess(runningApps, state, platform)) {
         return undefined;
       }
 
@@ -179,7 +187,7 @@ export function createCodexDesktopLauncher(options: {
     }
 
     const runningApps = await listRunningApps();
-    if (!isManagedDesktopProcess(runningApps, state)) {
+    if (!isManagedDesktopProcess(runningApps, state, platform)) {
       return null;
     }
 
@@ -324,7 +332,7 @@ export function createCodexDesktopLauncher(options: {
     }
 
     const runningApps = await listRunningApps();
-    if (!isManagedDesktopProcess(runningApps, state)) {
+    if (!isManagedDesktopProcess(runningApps, state, platform)) {
       return false;
     }
 
@@ -349,7 +357,7 @@ export function createCodexDesktopLauncher(options: {
     }
 
     const runningApps = await listRunningApps();
-    if (!isManagedDesktopProcess(runningApps, state)) {
+    if (!isManagedDesktopProcess(runningApps, state, platform)) {
       return false;
     }
 
@@ -390,7 +398,7 @@ export function createCodexDesktopLauncher(options: {
     }
 
     const runningApps = await listRunningApps();
-    if (!isManagedDesktopProcess(runningApps, state)) {
+    if (!isManagedDesktopProcess(runningApps, state, platform)) {
       throw new Error("No codexm-managed Codex Desktop session is running.");
     }
 

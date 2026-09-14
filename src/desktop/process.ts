@@ -1,11 +1,12 @@
 import { spawn as spawnCallback } from "node:child_process";
 
+import type { CodexmPlatform } from "../platform.js";
+import { getCodexBinarySuffix } from "../platform.js";
 import type {
   ExecFileLike,
   ManagedCodexDesktopState,
   RunningCodexDesktop,
 } from "./types.js";
-import { CODEX_BINARY_SUFFIX } from "./shared.js";
 
 export type LaunchProcessLike = (options: {
   appPath: string;
@@ -88,6 +89,7 @@ export async function launchManagedDesktopProcess(options: {
   binaryPath: string;
   args: readonly string[];
   env?: Record<string, string>;
+  platform?: CodexmPlatform;
 }, spawnImpl: SpawnLike = spawnCallback): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     // Launch through LaunchServices so Electron's own update/restart flow can
@@ -98,10 +100,21 @@ export async function launchManagedDesktopProcess(options: {
       "--env",
       `${key}=${value}`,
     ]);
-    const child = spawnImpl("open", [...envArgs, "-na", options.appPath, "--args", ...options.args], {
-      detached: true,
-      stdio: "ignore",
-    });
+
+    // On Windows there is no LaunchServices: spawn the executable directly.
+    // Codex Desktop ignores --remote-debugging-port there, but passing it is
+    // harmless and keeps a single launch contract across platforms.
+    const child =
+      (options.platform ?? "darwin") === "win32"
+        ? spawnImpl(options.binaryPath, [...options.args], {
+            detached: true,
+            stdio: "ignore",
+            env: { ...process.env, ...(options.env ?? {}) },
+          })
+        : spawnImpl("open", [...envArgs, "-na", options.appPath, "--args", ...options.args], {
+            detached: true,
+            stdio: "ignore",
+          });
 
     let settled = false;
 
@@ -127,8 +140,9 @@ export async function launchManagedDesktopProcess(options: {
 export function isManagedDesktopProcess(
   runningApps: RunningCodexDesktop[],
   state: ManagedCodexDesktopState,
+  platform: CodexmPlatform = "darwin",
 ): boolean {
-  const expectedBinaryPath = `${state.app_path}${CODEX_BINARY_SUFFIX}`;
+  const expectedBinaryPath = `${state.app_path}${getCodexBinarySuffix(platform)}`;
   const expectedPort = `--remote-debugging-port=${state.remote_debugging_port}`;
 
   return runningApps.some(

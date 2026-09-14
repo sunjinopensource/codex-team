@@ -10,6 +10,7 @@ import {
   launchManagedDesktopSession,
   restoreLaunchBackup,
 } from "../desktop/managed-state.js";
+import { describeDesktopNotFound } from "../desktop/shared.js";
 import { getPlatform } from "../platform.js";
 import type { DaemonProcessManager } from "../daemon/process.js";
 import { buildDaemonConfig, defaultDaemonState } from "../daemon/state.js";
@@ -74,18 +75,22 @@ export async function handleLaunchCommand(options: {
   }
 
   const launchPlatform = await getPlatform();
-  if (launchPlatform !== "darwin") {
+  if (launchPlatform === "wsl") {
     throw new Error(
-      launchPlatform === "wsl"
-        ? "codexm launch is not supported on WSL. Use \"codexm run [-- ...args]\" to start codex with auto-restart on auth changes."
-        : "codexm launch is not supported on Linux. Use \"codexm run [-- ...args]\" to start codex with auto-restart on auth changes.",
+      "codexm launch is not supported on WSL. Use \"codexm run [-- ...args]\" to start codex with auto-restart on auth changes.",
+    );
+  }
+
+  if (launchPlatform === "linux") {
+    throw new Error(
+      "codexm launch is not supported on Linux. Use \"codexm run [-- ...args]\" to start codex with auto-restart on auth changes.",
     );
   }
 
   const warnings: string[] = [];
   const appPath = await desktopLauncher.findInstalledApp();
   if (!appPath) {
-    throw new Error("Codex Desktop not found at /Applications/Codex.app.");
+    throw new Error(describeDesktopNotFound(launchPlatform));
   }
   const desktopApiBaseUrl = await resolveManagedDesktopApiBaseUrl(store);
   debugLog(`launch: requested_account=${name ?? "current"}`);
@@ -123,6 +128,35 @@ export async function handleLaunchCommand(options: {
     await desktopLauncher.quitRunningApps({ force: !canRelaunchGracefully });
   }
 
+  const launchDesktopSession = async (): Promise<void> => {
+    if (launchPlatform === "win32") {
+      // Codex Desktop on Windows ignores --remote-debugging-port, so there is
+      // no DevTools session to track. Launching (or relaunching) the app is
+      // what applies the current auth snapshot.
+      await desktopLauncher.launch(appPath, { apiBaseUrl: desktopApiBaseUrl });
+      warnings.push(
+        "Codex Desktop on Windows ignores --remote-debugging-port, so codexm launched it without managed-session tracking.",
+      );
+      return;
+    }
+
+    const { managedState, refreshedAccountSurface } = await launchManagedDesktopSession({
+      desktopLauncher,
+      appPath,
+      existingApps: runningApps,
+      platform: launchPlatform,
+      desktopApiBaseUrl,
+    });
+    debugLog(
+      `launch: recorded managed desktop pid=${managedState.pid} port=${managedState.remote_debugging_port}`,
+    );
+    if (!refreshedAccountSurface) {
+      warnings.push(
+        "Codex Desktop launched, but codexm could not refresh the in-app account surface yet.",
+      );
+    }
+  };
+
   let switchedAccount: Awaited<ReturnType<AccountStore["switchAccount"]>>["account"] | null = null;
   let switchBackupPath: string | null = null;
   const requestedTargetName = name;
@@ -156,21 +190,7 @@ export async function handleLaunchCommand(options: {
       }
 
       try {
-        const { managedState, refreshedAccountSurface } = await launchManagedDesktopSession({
-          desktopLauncher,
-          appPath,
-          existingApps: runningApps,
-          platform: launchPlatform,
-          desktopApiBaseUrl,
-        });
-        debugLog(
-          `launch: recorded managed desktop pid=${managedState.pid} port=${managedState.remote_debugging_port}`,
-        );
-        if (!refreshedAccountSurface) {
-          warnings.push(
-            "Codex Desktop launched, but codexm could not refresh the in-app account surface yet.",
-          );
-        }
+        await launchDesktopSession();
       } catch (error) {
         if (switchedAccount) {
           await restoreLaunchBackup(store, switchBackupPath).catch(() => undefined);
@@ -184,21 +204,7 @@ export async function handleLaunchCommand(options: {
       await lock.release();
     }
   } else {
-    const { managedState, refreshedAccountSurface } = await launchManagedDesktopSession({
-      desktopLauncher,
-      appPath,
-      existingApps: runningApps,
-      platform: launchPlatform,
-      desktopApiBaseUrl,
-    });
-    debugLog(
-      `launch: recorded managed desktop pid=${managedState.pid} port=${managedState.remote_debugging_port}`,
-    );
-    if (!refreshedAccountSurface) {
-      warnings.push(
-        "Codex Desktop launched, but codexm could not refresh the in-app account surface yet.",
-      );
-    }
+    await launchDesktopSession();
   }
 
   const currentDaemonState = (await daemonProcessManager.getStatus()).state

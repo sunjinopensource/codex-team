@@ -11,7 +11,7 @@ describe("getPlatform", () => {
   test("returns a valid platform string", async () => {
     resetPlatformCache();
     const platform = await getPlatform();
-    expect(["darwin", "linux", "wsl"]).toContain(platform);
+    expect(["darwin", "linux", "wsl", "win32"]).toContain(platform);
   });
 
   test("caches the result across calls", async () => {
@@ -69,6 +69,42 @@ describe("isCodexDesktopCommand", () => {
     expect(
       isCodexDesktopCommand("/usr/local/bin/codex --remote-debugging-port=9223", "wsl"),
     ).toBe(true);
+  });
+
+  test("matches the Windows MSIX Desktop executable", () => {
+    expect(
+      isCodexDesktopCommand(
+        "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.908.4834.0_x64__2p2nqsd0c76g0\\app\\ChatGPT.exe",
+        "win32",
+      ),
+    ).toBe(true);
+  });
+
+  test("matches a classic Windows install", () => {
+    expect(
+      isCodexDesktopCommand(
+        "C:\\Users\\jinsun\\AppData\\Local\\Programs\\codex\\Codex.exe",
+        "win32",
+      ),
+    ).toBe(true);
+  });
+
+  test("does not match the codex CLI on win32", () => {
+    expect(
+      isCodexDesktopCommand(
+        "C:\\Users\\jinsun\\AppData\\Local\\OpenAI\\Codex\\bin\\bffc5354119c8421\\codex.exe",
+        "win32",
+      ),
+    ).toBe(false);
+  });
+
+  test("does not match an unrelated ChatGPT process on win32", () => {
+    expect(
+      isCodexDesktopCommand(
+        "C:\\Program Files\\WindowsApps\\OpenAI.ChatGPT_1.0.0.0_x64__abc\\app\\ChatGPT.exe",
+        "win32",
+      ),
+    ).toBe(false);
   });
 });
 

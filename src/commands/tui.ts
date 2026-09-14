@@ -15,6 +15,7 @@ import {
   isOnlyManagedDesktopInstanceRunning,
   launchManagedDesktopSession,
 } from "../desktop/managed-state.js";
+import { describeDesktopNotFound } from "../desktop/shared.js";
 import { getPlatform } from "../platform.js";
 import { PROXY_ACCOUNT_NAME } from "../proxy/constants.js";
 import { formatProxyUpstreamSelectionLabel } from "../proxy/request-log.js";
@@ -57,6 +58,11 @@ import {
 } from "./tui-runtime.js";
 
 export { buildAccountDashboardSnapshot, buildCachedAccountDashboardSnapshot } from "./tui-snapshot.js";
+
+const WINDOWS_UNMANAGED_DESKTOP_WARNING =
+  "Codex Desktop on Windows cannot be refreshed in place, so the running app keeps its current auth. Press Shift+D to relaunch it with the selected account.";
+const WINDOWS_MANAGED_DESKTOP_UNAVAILABLE_WARNING =
+  "Codex Desktop on Windows ignores --remote-debugging-port, so codexm relaunched it with the selected auth instead of refreshing it in place.";
 
 export async function handleTuiCommand(options: {
   positionals: string[];
@@ -245,13 +251,45 @@ export async function handleTuiCommand(options: {
           }
         },
         openDesktop: async (name, desktopOptions = {}) => {
+          const platform = await getPlatform();
           const appPath = await options.desktopLauncher.findInstalledApp();
           if (!appPath) {
-            throw new Error("Codex Desktop not found at /Applications/Codex.app.");
+            throw new Error(describeDesktopNotFound(platform));
           }
           const desktopApiBaseUrl = await resolveManagedDesktopApiBaseUrl(options.store);
 
           const runningApps = await options.desktopLauncher.listRunningApps();
+
+          // Codex Desktop on Windows ignores --remote-debugging-port, so the
+          // DevTools-driven managed session is unavailable there. The switch
+          // already rewrote the shared auth file, so a fresh launch (or a
+          // forced relaunch) is what applies the new account.
+          if (platform === "win32") {
+            if (runningApps.length > 0 && !desktopOptions.forceRelaunch) {
+              await options.desktopLauncher.activateApp(appPath);
+              return {
+                statusMessage: `Focused Codex Desktop for "${name}".`,
+                warningMessages: [WINDOWS_UNMANAGED_DESKTOP_WARNING],
+              };
+            }
+
+            if (runningApps.length > 0) {
+              await options.desktopLauncher.quitRunningApps({ force: true });
+            }
+
+            await options.desktopLauncher.launch(appPath, {
+              apiBaseUrl: desktopApiBaseUrl,
+            });
+            await externalUpdateMonitors.reconcileNow();
+
+            return {
+              statusMessage: runningApps.length > 0
+                ? `Relaunched Codex Desktop for "${name}".`
+                : `Opened Codex Desktop for "${name}".`,
+              warningMessages: [WINDOWS_MANAGED_DESKTOP_UNAVAILABLE_WARNING],
+            };
+          }
+
           if (runningApps.length > 0 && !desktopOptions.forceRelaunch) {
             await options.desktopLauncher.activateApp(appPath);
             const warnings = (await options.desktopLauncher.isManagedDesktopRunning())
@@ -266,7 +304,6 @@ export async function handleTuiCommand(options: {
             };
           }
 
-          const platform = await getPlatform();
           if (runningApps.length > 0 && desktopOptions.forceRelaunch) {
             const managedDesktopState = await options.desktopLauncher.readManagedState();
             const canRelaunchGracefully = isOnlyManagedDesktopInstanceRunning(

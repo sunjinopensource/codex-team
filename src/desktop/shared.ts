@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { CodexmPlatform } from "../platform.js";
+
 export const DEFAULT_CODEX_REMOTE_DEBUGGING_PORT = 39223;
 export const DEFAULT_CODEX_DESKTOP_STATE_PATH = join(
   homedir(),
@@ -41,6 +43,22 @@ export function buildCodexDesktopGuardExpression(): string {
 export const CODEX_APP_SERVER_RESTART_EXPRESSION = `(async () => {${buildCodexDesktopGuardExpression()}
   await window.electronBridge.sendMessageFromView({ type: "codex-app-server-restart", hostId: "local" });
 })()`;
+
+/**
+ * Platform-accurate "app not installed" message. The macOS wording used to be
+ * reused everywhere, which was misleading on Windows and Linux.
+ */
+export function describeDesktopNotFound(platform: CodexmPlatform): string {
+  if (platform === "win32") {
+    return "Codex Desktop not found. Install the Codex app (MSIX package OpenAI.Codex) or a classic install under %LOCALAPPDATA%\\Programs\\codex.";
+  }
+
+  if (platform === "darwin") {
+    return "Codex Desktop not found at /Applications/Codex.app.";
+  }
+
+  return 'Codex Desktop not found. Install the Codex app or make sure "codex" is on PATH.';
+}
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

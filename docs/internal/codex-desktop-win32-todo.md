@@ -217,3 +217,29 @@ Windows Desktop 通路做完后，至少要满足：
 ## 9. 后续实现备注
 
 真正开做时，建议先补一份正式 spec，再实现，不要直接按这页 TODO 开写。
+
+## 10. 实测结论（2026-09-13，OpenAI.Codex_26.908.4834.0）
+
+在本机（Windows）实测的前提 1 不成立，Windows 通路因此降级为非托管：
+
+1. 安装形态是 MSIX：`C:\Program Files\WindowsApps\OpenAI.Codex_<版本>_x64__<publisher>\`，
+   `AppxManifest.xml` 入口为 `<Application Id="App" Executable="app/ChatGPT.exe">`。
+   `app\ChatGPT.exe`（约 4.6 MB）是 Electron 主程序，`app\Codex.exe`（约 1.1 MB）只是启动器。
+2. `Start-Process ...\app\ChatGPT.exe --remote-debugging-port=9333`：进程能起来，但
+   `netstat` 无 9333/9222 监听，`http://127.0.0.1:<port>/json/version` 全部失败。
+   即该构建忽略 `--remote-debugging-port`。
+3. 结论：受管通路（`launchManagedDesktopSession` / DevTools bridge / watch / in-place refresh）
+   在 Windows 上无法启用。第 8 节里的验收项 2–5 暂不适用。
+
+因此已落地的 Windows v1 只做非托管通路（`src/platform-desktop-adapter.ts`）：
+
+- 发现：`WindowsApps\OpenAI.Codex_*\app\ChatGPT.exe` 目录扫描 → 经典安装路径 → `Get-AppxPackage` 兜底
+- 枚举：`Get-Process -Name ChatGPT,Codex | Select Id,Path`（再按路径过滤，避免命中
+  `%LOCALAPPDATA%\OpenAI\Codex\bin\...\codex.exe` 这个 CLI）
+- 退出：`taskkill /PID <pid> /T [/F]`
+- 聚焦：`WScript.Shell.AppActivate(pid)`
+- 启动：直接 spawn exe（不走 `open -na`）
+- 语义：切号后 `~/.codex/auth.json` 已更新，按 `d` 只聚焦并提示“需 Shift+D 重启才生效”，
+  按 `Shift+D` 则退出并重启桌面端来应用新身份
+
+平台相关分支统一通过 `platform` 参数传递（不在主逻辑里散落 `process.platform` 判断）。

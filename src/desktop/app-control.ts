@@ -7,6 +7,7 @@ import {
   readProcessParentAndCommand,
   type LaunchProcessLike,
 } from "./process.js";
+import { getCodexBinarySuffix, type CodexmPlatform } from "../platform.js";
 import {
   CODEX_APP_NAME,
   CODEX_BINARY_SUFFIX,
@@ -151,9 +152,13 @@ export async function quitRunningDesktopApps(
 export async function launchDesktopApp(
   launchProcessImpl: LaunchProcessLike,
   appPath: string,
-  options?: { apiBaseUrl?: string | null },
+  options?: { apiBaseUrl?: string | null; platform?: CodexmPlatform },
 ): Promise<void> {
-  const binaryPath = `${appPath}${CODEX_BINARY_SUFFIX}`;
+  // On Windows the resolved app path is already the executable.
+  const binaryPath =
+    (options?.platform ?? "darwin") === "win32"
+      ? appPath
+      : `${appPath}${CODEX_BINARY_SUFFIX}`;
 
   await launchProcessImpl({
     appPath,
