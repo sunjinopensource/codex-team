@@ -1,5 +1,10 @@
 import { randomBytes, createHash } from "node:crypto";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { spawn } from "node:child_process";
 
 import type { AuthSnapshot } from "./auth-snapshot.js";
@@ -32,10 +37,25 @@ export interface CodexDeviceLoginSession {
   cancel(reason?: string): void;
 }
 
+/**
+ * A started browser login. The caller hands the authorize URL back immediately
+ * (the operator opens it in a browser on the machine that runs codexm, because
+ * OpenAI redirects to a loopback port there) and awaits `wait()`.
+ */
+export interface CodexBrowserLoginSession {
+  authorizeUrl: string;
+  redirectUri: string;
+  wait(): Promise<AuthSnapshot>;
+  /** Abandons the flow; a pending `wait()` rejects and the callback port is released. */
+  cancel(reason?: string): void;
+}
+
 export interface CodexLoginProvider {
   login(request: CodexLoginRequest): Promise<AuthSnapshot>;
   /** Optional: only providers that can drive the device flow expose it. */
   startDeviceLogin?(): Promise<CodexDeviceLoginSession>;
+  /** Optional: only providers that can drive the browser flow expose it. */
+  startBrowserLogin?(): Promise<CodexBrowserLoginSession>;
 }
 
 interface TokenExchangeResponse {
@@ -224,63 +244,186 @@ function writeHtml(response: ServerResponse, status: number, body: string): void
   response.end(body);
 }
 
+interface BrowserCallbackServerHandle {
+  /** Resolves once the loopback listener is up; rejects when the port is taken. */
+  ready: Promise<void>;
+  result: Promise<{ result: BrowserCallbackResult; redirectUri: string }>;
+  close: () => void;
+}
+
+function startBrowserCallbackServer(
+  state: string,
+  port: number,
+  stderr?: NodeJS.WriteStream,
+): BrowserCallbackServerHandle {
+  let resolveResult: (value: { result: BrowserCallbackResult; redirectUri: string }) => void =
+    () => undefined;
+  let rejectResult: (error: Error) => void = () => undefined;
+  const result = new Promise<{ result: BrowserCallbackResult; redirectUri: string }>(
+    (resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    },
+  );
+
+  const redirectUri = `http://localhost:${port}/auth/callback`;
+  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+    const rawUrl = request.url ?? "/";
+    const url = new URL(rawUrl, `http://localhost:${port}`);
+
+    if (url.pathname !== "/auth/callback") {
+      writeHtml(response, 404, "<h1>Not found</h1>");
+      return;
+    }
+
+    const error = url.searchParams.get("error");
+    if (error) {
+      writeHtml(response, 400, "<h1>Codex login failed</h1><p>You can close this window.</p>");
+      rejectResult(new Error(`Codex login failed: ${error}`));
+      server.close();
+      return;
+    }
+
+    const code = url.searchParams.get("code");
+    const returnedState = url.searchParams.get("state");
+    if (!code || !returnedState) {
+      writeHtml(response, 400, "<h1>Codex login failed</h1><p>Missing callback parameters.</p>");
+      rejectResult(new Error("Codex login callback is missing code or state."));
+      server.close();
+      return;
+    }
+
+    if (returnedState !== state) {
+      writeHtml(response, 400, "<h1>Codex login failed</h1><p>Invalid state.</p>");
+      rejectResult(new Error("Codex login callback state mismatch."));
+      server.close();
+      return;
+    }
+
+    writeHtml(response, 200, "<h1>Codex login complete</h1><p>You can close this window.</p>");
+    resolveResult({
+      result: {
+        code,
+        state: returnedState,
+      },
+      redirectUri,
+    });
+    server.close();
+  });
+
+  server.on("error", (error: Error) => {
+    rejectResult(error);
+  });
+
+  const ready = new Promise<void>((resolve, reject) => {
+    if (server.listening) {
+      resolve();
+      return;
+    }
+    server.once("listening", () => {
+      stderr?.write(`Waiting for Codex login callback on http://localhost:${port}.\n`);
+      resolve();
+    });
+    server.once("error", reject);
+  });
+
+  server.listen(port, "127.0.0.1");
+
+  return {
+    ready,
+    result,
+    close: () => server.close(),
+  };
+}
+
 async function waitForBrowserCallback(
   state: string,
   stderr: NodeJS.WriteStream,
 ): Promise<{ result: BrowserCallbackResult; redirectUri: string }> {
-  return new Promise((resolve, reject) => {
-    const server = createServer((request: IncomingMessage, response: ServerResponse) => {
-      const rawUrl = request.url ?? "/";
-      const url = new URL(rawUrl, `http://localhost:${CODEX_LOGIN_PORT}`);
+  return await startBrowserCallbackServer(state, CODEX_LOGIN_PORT, stderr).result;
+}
 
-      if (url.pathname !== "/auth/callback") {
-        writeHtml(response, 404, "<h1>Not found</h1>");
-        return;
-      }
+/**
+ * Starts (but does not await) a browser login. The caller shows `authorizeUrl`
+ * first — OpenAI redirects to a loopback port on the machine running codexm —
+ * then awaits `wait()`.
+ */
+export async function startCodexBrowserLogin(
+  fetchImpl: typeof fetch = globalThis.fetch,
+  options: {
+    port?: number;
+    stderr?: NodeJS.WriteStream;
+    openBrowser?: boolean;
+    spawnImpl?: SpawnLike;
+  } = {},
+): Promise<CodexBrowserLoginSession> {
+  const port = options.port ?? CODEX_LOGIN_PORT;
+  const state = generateBase64Url(32);
+  const pkce = generatePkceCodes();
+  const redirectUri = `http://localhost:${port}/auth/callback`;
+  const authorizeUrl = buildAuthorizeUrl(state, redirectUri, pkce);
+  const server = startBrowserCallbackServer(state, port, options.stderr);
+  // A late rejection still has to be observed when `wait()` is never awaited.
+  server.result.catch(() => undefined);
 
-      const error = url.searchParams.get("error");
-      if (error) {
-        writeHtml(response, 400, "<h1>Codex login failed</h1><p>You can close this window.</p>");
-        reject(new Error(`Codex login failed: ${error}`));
-        server.close();
-        return;
-      }
+  await server.ready;
 
-      const code = url.searchParams.get("code");
-      const returnedState = url.searchParams.get("state");
-      if (!code || !returnedState) {
-        writeHtml(response, 400, "<h1>Codex login failed</h1><p>Missing callback parameters.</p>");
-        reject(new Error("Codex login callback is missing code or state."));
-        server.close();
-        return;
-      }
-
-      if (returnedState !== state) {
-        writeHtml(response, 400, "<h1>Codex login failed</h1><p>Invalid state.</p>");
-        reject(new Error("Codex login callback state mismatch."));
-        server.close();
-        return;
-      }
-
-      writeHtml(response, 200, "<h1>Codex login complete</h1><p>You can close this window.</p>");
-      resolve({
-        result: {
-          code,
-          state: returnedState,
+  if (options.openBrowser) {
+    try {
+      openBrowser(
+        authorizeUrl,
+        (error) => {
+          options.stderr?.write(`Failed to open browser automatically: ${error.message}\n`);
         },
-        redirectUri: `http://localhost:${CODEX_LOGIN_PORT}/auth/callback`,
-      });
+        options.spawnImpl ?? spawn,
+      );
+    } catch (error) {
+      options.stderr?.write(`Failed to open browser automatically: ${(error as Error).message}\n`);
+    }
+  }
+
+  const cancelListeners = new Set<(error: Error) => void>();
+  let cancellation: Error | null = null;
+
+  return {
+    authorizeUrl,
+    redirectUri,
+    wait: async (): Promise<AuthSnapshot> => {
+      if (cancellation) {
+        throw cancellation;
+      }
+
+      const { result } = await Promise.race([
+        server.result,
+        new Promise<never>((_, reject) => {
+          if (cancellation) {
+            reject(cancellation);
+            return;
+          }
+          cancelListeners.add(reject);
+        }),
+      ]);
+
+      const tokens = await exchangeCodeForTokens(
+        fetchImpl,
+        result.code,
+        redirectUri,
+        pkce.codeVerifier,
+      );
+      return authSnapshotFromTokens(tokens);
+    },
+    cancel: (reason?: string) => {
+      if (cancellation) {
+        return;
+      }
+      cancellation = new Error(reason ?? "Codex browser login was cancelled.");
       server.close();
-    });
-
-    server.on("error", (error) => {
-      reject(error);
-    });
-
-    server.listen(CODEX_LOGIN_PORT, "127.0.0.1", () => {
-      stderr.write(`Waiting for Codex login callback on http://localhost:${CODEX_LOGIN_PORT}.\n`);
-    });
-  });
+      for (const listener of cancelListeners) {
+        listener(cancellation);
+      }
+      cancelListeners.clear();
+    },
+  };
 }
 
 function parseDeviceInterval(value: string | number | undefined): number {
@@ -468,5 +611,6 @@ export function createCodexLoginProvider(
       return await session.wait();
     },
     startDeviceLogin: () => startCodexDeviceLogin(fetchImpl),
+    startBrowserLogin: () => startCodexBrowserLogin(fetchImpl, { spawnImpl }),
   };
 }

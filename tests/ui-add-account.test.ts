@@ -2,7 +2,11 @@ import { describe, expect, test } from "@rstest/core";
 
 import { createAccountStore } from "../src/account-store/index.js";
 import type { AuthSnapshot } from "../src/auth-snapshot.js";
-import type { CodexDeviceLoginSession, CodexLoginProvider } from "../src/codex-login.js";
+import type {
+  CodexBrowserLoginSession,
+  CodexDeviceLoginSession,
+  CodexLoginProvider,
+} from "../src/codex-login.js";
 import { createAccountAddFlows, performUiAddAccount } from "../src/commands/ui.js";
 import {
   cleanupTempHome,
@@ -15,19 +19,31 @@ function createFakeLogin(snapshot: AuthSnapshot) {
   let resolveWait: ((value: AuthSnapshot) => void) | null = null;
   let rejectWait: ((error: Error) => void) | null = null;
   let startCalls = 0;
+  let browserStartCalls = 0;
+
+  const pending = (): Promise<AuthSnapshot> =>
+    new Promise<AuthSnapshot>((resolve, reject) => {
+      resolveWait = resolve;
+      rejectWait = reject;
+    });
+
+  const cancel = (reason?: string) => {
+    rejectWait?.(new Error(reason ?? "已取消添加账号。"));
+  };
 
   const session: CodexDeviceLoginSession = {
     userCode: "ABCD-EFGH",
     verificationUrl: "https://auth.openai.com/codex/device",
     intervalMs: 5,
-    wait: () =>
-      new Promise<AuthSnapshot>((resolve, reject) => {
-        resolveWait = resolve;
-        rejectWait = reject;
-      }),
-    cancel: (reason?: string) => {
-      rejectWait?.(new Error(reason ?? "已取消添加账号。"));
-    },
+    wait: pending,
+    cancel,
+  };
+
+  const browserSession: CodexBrowserLoginSession = {
+    authorizeUrl: "https://auth.openai.com/oauth/authorize?client_id=app_test",
+    redirectUri: "http://localhost:1455/auth/callback",
+    wait: pending,
+    cancel,
   };
 
   const provider: CodexLoginProvider = {
@@ -36,12 +52,17 @@ function createFakeLogin(snapshot: AuthSnapshot) {
       startCalls += 1;
       return session;
     },
+    startBrowserLogin: async () => {
+      browserStartCalls += 1;
+      return browserSession;
+    },
   };
 
   return {
     provider,
     approve: (value: AuthSnapshot = snapshot) => resolveWait?.(value),
     startCalls: () => startCalls,
+    browserStartCalls: () => browserStartCalls,
   };
 }
 
@@ -100,7 +121,7 @@ describe("console add account", () => {
       });
 
       expect(pending.status).toBe("pending");
-      if (pending.status !== "pending") {
+      if (pending.status !== "pending" || pending.mode !== "device") {
         throw new Error("expected a pending device flow");
       }
       expect(pending.userCode).toBe("ABCD-EFGH");
@@ -113,6 +134,65 @@ describe("console add account", () => {
       expect(flows.get(pending.flowId)?.status).toBe("done");
       const { accounts } = await store.listAccounts();
       expect(accounts.map((account) => account.name)).toContain("gamma");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("hands back an authorize URL and saves the snapshot after the browser callback", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = await seedStore(homeDir);
+      const flows = createAccountAddFlows();
+      const snapshot = createAuthPayload("acct-browser-add", "chatgpt", "plus", "user-browser-add");
+      const login = createFakeLogin(snapshot);
+
+      const pending = await performUiAddAccount({
+        store,
+        authLogin: login.provider,
+        flows,
+        name: "beta",
+        method: "browser",
+      });
+
+      expect(pending.status).toBe("pending");
+      if (pending.status !== "pending" || pending.mode !== "browser") {
+        throw new Error("expected a pending browser flow");
+      }
+      expect(pending.authorizeUrl).toContain("https://auth.openai.com/oauth/authorize");
+      expect(login.browserStartCalls()).toBe(1);
+      expect(login.startCalls()).toBe(0);
+
+      login.approve();
+      await flows.settled();
+
+      expect(flows.get(pending.flowId)?.status).toBe("done");
+      const { accounts } = await store.listAccounts();
+      expect(accounts.map((account) => account.name)).toContain("beta");
+      expect(accounts.find((account) => account.name === "beta")?.auth_mode).toBe("chatgpt");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("refuses browser login when the provider cannot start it", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = await seedStore(homeDir);
+
+      await expect(
+        performUiAddAccount({
+          store,
+          authLogin: providerWithoutDeviceLogin(
+            createAuthPayload("acct-no-browser", "chatgpt", "plus", "user-no-browser"),
+          ),
+          flows: createAccountAddFlows(),
+          name: "zeta",
+          method: "browser",
+        }),
+      ).rejects.toThrow("浏览器回调登录");
     } finally {
       await cleanupTempHome(homeDir);
     }

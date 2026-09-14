@@ -6,7 +6,7 @@ import type { AccountStore } from "../account-store/index.js";
 import { ensureAccountName } from "../account-store/storage.js";
 import type { AuthSnapshot } from "../auth-snapshot.js";
 import { runAuthRefreshSweep } from "../auth-refresh.js";
-import type { CodexDeviceLoginSession, CodexLoginProvider } from "../codex-login.js";
+import type { CodexLoginProvider } from "../codex-login.js";
 import type { CodexDesktopLauncher } from "../desktop/launcher.js";
 import {
   restartManagedDesktopSession,
@@ -136,6 +136,20 @@ function renderPage(): string {
     border-radius: 8px; padding: 9px 11px; font-size: 13px; width: 100%;
   }
   input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input.invalid { border-color: var(--hot); }
+  input.invalid:focus { border-color: var(--hot); box-shadow: 0 0 0 2px rgba(255,86,86,.2); }
+  .field-error {
+    display: none; color: #ff9a9a; font-size: 12px; padding: 8px 11px;
+    background: rgba(255,86,86,.1); border: 1px solid rgba(255,86,86,.35);
+    border-left: 3px solid var(--hot); border-radius: 8px;
+  }
+  .field-error.show { display: block; }
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-5px); }
+    75% { transform: translateX(5px); }
+  }
+  .shake { animation: shake .16s ease-in-out 0s 2; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
   .code {
     font-size: 24px; letter-spacing: 3px; font-weight: 650; text-align: center;
@@ -163,10 +177,12 @@ function renderPage(): string {
       <label for="addName">账号名称</label>
       <input id="addName" autocomplete="off" placeholder="例如 work-plus">
     </div>
+    <div class="field-error" id="addError"></div>
     <div class="field">
       <label for="addMethod">登录方式</label>
       <select id="addMethod">
         <option value="device">设备码登录（推荐）</option>
+        <option value="browser">浏览器回调登录（控制台在本机时）</option>
         <option value="apikey">API key</option>
       </select>
     </div>
@@ -178,6 +194,11 @@ function renderPage(): string {
       <label>在浏览器打开 <a id="addVerifyLink" href="#" target="_blank" rel="noreferrer">授权页面</a> 并输入下面的设备码</label>
       <div class="code" id="addCode">…</div>
       <div class="sub" id="addStatus">等待确认…</div>
+    </div>
+    <div class="field" id="addLinkField" style="display:none">
+      <label>在浏览器里完成 ChatGPT 登录，授权后会自动回到控制台</label>
+      <div><a id="addAuthorizeLink" href="#" target="_blank" rel="noreferrer">重新打开授权页面</a></div>
+      <div class="sub" id="addLinkStatus">等待浏览器回调…</div>
     </div>
     <div class="modal-actions">
       <button id="addCancelBtn">取消</button>
@@ -368,9 +389,94 @@ function renderPage(): string {
   const addCode = document.getElementById("addCode");
   const addStatus = document.getElementById("addStatus");
   const addVerifyLink = document.getElementById("addVerifyLink");
+  const addLinkField = document.getElementById("addLinkField");
+  const addAuthorizeLink = document.getElementById("addAuthorizeLink");
+  const addLinkStatus = document.getElementById("addLinkStatus");
+  const addError = document.getElementById("addError");
   const addSubmitBtn = document.getElementById("addSubmitBtn");
   let addPoller = null;
   let addFlowId = "";
+
+  function clearAddError() {
+    addError.classList.remove("show");
+    addError.textContent = "";
+    addName.classList.remove("invalid");
+    addKey.classList.remove("invalid");
+  }
+
+  /**
+   * Browser callback flows need a user-gesture window, so the tab is opened while the
+   * click is still fresh and navigated once the authorize URL comes back.
+   */
+  let authorizeWindow = null;
+  let authorizeWindowBlank = false;
+
+  function prepareAuthorizeWindow() {
+    if (addMethod.value !== "browser") {
+      return;
+    }
+    const win = window.open("", "_blank");
+    if (!win) {
+      return;
+    }
+    authorizeWindow = win;
+    authorizeWindowBlank = true;
+    try {
+      win.document.write("<title>正在打开授权页面…</title>正在打开 OpenAI 授权页面…");
+      win.document.close();
+    } catch (error) {
+      /* ignore cross-origin write failures */
+    }
+  }
+
+  function navigateAuthorizeWindow(url) {
+    if (authorizeWindow && !authorizeWindow.closed) {
+      authorizeWindow.location.href = url;
+      authorizeWindowBlank = false;
+      return true;
+    }
+    const win = window.open(url, "_blank");
+    if (!win) {
+      return false;
+    }
+    authorizeWindow = win;
+    authorizeWindowBlank = false;
+    return true;
+  }
+
+  /** Closes the placeholder tab only; a tab already on the authorize page stays open. */
+  function dropAuthorizeWindow() {
+    if (authorizeWindow && authorizeWindowBlank && !authorizeWindow.closed) {
+      authorizeWindow.close();
+    }
+    authorizeWindow = null;
+    authorizeWindowBlank = false;
+  }
+
+  function showAddError(message, target) {
+    addError.textContent = message;
+    addError.classList.add("show");
+    if (!target) {
+      return;
+    }
+    target.classList.add("invalid");
+    target.classList.remove("shake");
+    void target.offsetWidth;
+    target.classList.add("shake");
+    setTimeout(function () {
+      target.classList.remove("shake");
+    }, 420);
+    target.focus();
+  }
+
+  /** Keeps the complaint inside the open dialog; the toast is easy to miss. */
+  function notifyAddError(message, target) {
+    if (addModal.classList.contains("hidden")) {
+      toast(message, "error");
+      return;
+    }
+    showAddError(message, target);
+  }
 
   function stopAddPoller() {
     if (addPoller) {
@@ -381,6 +487,7 @@ function renderPage(): string {
 
   function closeAddModal() {
     stopAddPoller();
+    dropAuthorizeWindow();
     addModal.classList.add("hidden");
   }
 
@@ -390,15 +497,21 @@ function renderPage(): string {
     addMethod.value = "device";
     addKeyField.style.display = "none";
     addCodeField.style.display = "none";
+    addLinkField.style.display = "none";
     addSubmitBtn.disabled = false;
     addSubmitBtn.textContent = "开始";
+    clearAddError();
     addModal.classList.remove("hidden");
     addName.focus();
   }
 
   addMethod.addEventListener("change", function () {
     addKeyField.style.display = addMethod.value === "apikey" ? "" : "none";
+    clearAddError();
   });
+
+  addName.addEventListener("input", clearAddError);
+  addKey.addEventListener("input", clearAddError);
 
   document.getElementById("addBtn").addEventListener("click", openAddModal);
 
@@ -413,10 +526,16 @@ function renderPage(): string {
   async function submitAdd(force) {
     const name = addName.value.trim();
     if (!name) {
-      toast("请填写账号名称", "warn");
+      showAddError("请填写账号名称，例如 work-plus", addName);
       return;
     }
 
+    if (addMethod.value === "apikey" && !addKey.value.trim()) {
+      showAddError("请填写 OpenAI API key", addKey);
+      return;
+    }
+
+    clearAddError();
     addSubmitBtn.disabled = true;
     try {
       const payload = await api("/api/accounts/add", "POST", {
@@ -429,6 +548,7 @@ function renderPage(): string {
       if (payload.requires_confirmation) {
         if (!window.confirm(payload.message)) {
           addSubmitBtn.disabled = false;
+          dropAuthorizeWindow();
           return;
         }
         await submitAdd(true);
@@ -444,16 +564,27 @@ function renderPage(): string {
       }
 
       addFlowId = payload.flowId;
-      addCode.textContent = payload.userCode;
-      addVerifyLink.href = payload.verificationUrl;
-      addCodeField.style.display = "";
-      addStatus.textContent = "等待浏览器确认…";
+
+      if (payload.mode === "browser") {
+        addAuthorizeLink.href = payload.authorizeUrl;
+        addLinkField.style.display = "";
+        const opened = navigateAuthorizeWindow(payload.authorizeUrl);
+        addLinkStatus.textContent = opened
+          ? "已在新标签页打开授权页面，登录完成后会自动继续。"
+          : "浏览器拦截了自动打开，请点击上面的链接完成登录。";
+      } else {
+        addCode.textContent = payload.userCode;
+        addVerifyLink.href = payload.verificationUrl;
+        addCodeField.style.display = "";
+        addStatus.textContent = "等待浏览器确认…";
+      }
       addSubmitBtn.textContent = "等待确认…";
       stopAddPoller();
       addPoller = setInterval(pollAdd, 2000);
     } catch (error) {
-      toast(error.message, "error");
+      notifyAddError(error.message);
       addSubmitBtn.disabled = false;
+      dropAuthorizeWindow();
     }
   }
 
@@ -463,6 +594,9 @@ function renderPage(): string {
     try {
       const payload = await api("/api/accounts/add/status?flowId=" + encodeURIComponent(addFlowId));
       addStatus.textContent = payload.message;
+      addLinkStatus.textContent = authorizeWindow && !authorizeWindow.closed
+        ? "已在新标签页打开授权页面，登录完成后会自动继续。"
+        : payload.message;
 
       if (payload.status === "done") {
         stopAddPoller();
@@ -478,17 +612,28 @@ function renderPage(): string {
         addFlowId = "";
         addSubmitBtn.disabled = false;
         addSubmitBtn.textContent = "重试";
-        toast(payload.message, "error");
+        notifyAddError(payload.message);
+        dropAuthorizeWindow();
       }
     } catch (error) {
       stopAddPoller();
       addFlowId = "";
       addSubmitBtn.disabled = false;
-      toast(error.message, "error");
+      notifyAddError(error.message);
+      dropAuthorizeWindow();
     }
   }
 
   addSubmitBtn.addEventListener("click", function () {
+    if (!addName.value.trim()) {
+      showAddError("请填写账号名称，例如 work-plus", addName);
+      return;
+    }
+    if (addMethod.value === "apikey" && !addKey.value.trim()) {
+      showAddError("请填写 OpenAI API key", addKey);
+      return;
+    }
+    prepareAuthorizeWindow();
     submitAdd(false);
   });
 
@@ -812,7 +957,7 @@ export async function performDesktopRelaunch(options: {
   }
 }
 
-export type UiAddAccountMethod = "device" | "apikey";
+export type UiAddAccountMethod = "device" | "browser" | "apikey";
 
 export interface UiAddedAccount {
   name: string;
@@ -831,9 +976,9 @@ interface AccountAddFlow {
 }
 
 /**
- * Tracks device-code logins started from the console. A HTTP handler has to
- * hand the code back immediately, while approval happens minutes later in the
- * operator's browser, so the login lives here instead of in one request.
+ * Tracks logins started from the console. A HTTP handler has to hand the code
+ * or authorize URL back immediately, while approval happens minutes later in
+ * the operator's browser, so the login lives here instead of in one request.
  */
 export function createAccountAddFlows() {
   const flows = new Map<string, AccountAddFlow>();
@@ -841,7 +986,7 @@ export function createAccountAddFlows() {
   return {
     async start(options: {
       name: string;
-      session: CodexDeviceLoginSession;
+      cancel: () => void;
       wait: Promise<AuthSnapshot>;
       complete: (snapshot: AuthSnapshot) => Promise<UiAddedAccount>;
       debugLog?: DebugLogger;
@@ -852,7 +997,7 @@ export function createAccountAddFlows() {
         name: options.name,
         status: "pending",
         message: "等待浏览器确认…",
-        cancel: () => options.session.cancel("已取消添加账号。"),
+        cancel: options.cancel,
         settled: Promise.resolve(),
       };
       flows.set(id, flow);
@@ -910,14 +1055,22 @@ export type AccountAddFlows = ReturnType<typeof createAccountAddFlows>;
 
 export type UiAddAccountResult =
   | { status: "added"; message: string; account: UiAddedAccount }
+  | { status: "confirm-overwrite"; message: string }
   | {
       status: "pending";
+      mode: "device";
       message: string;
       flowId: string;
       userCode: string;
       verificationUrl: string;
     }
-  | { status: "confirm-overwrite"; message: string };
+  | {
+      status: "pending";
+      mode: "browser";
+      message: string;
+      flowId: string;
+      authorizeUrl: string;
+    };
 
 /**
  * Adds a managed account from the console: an API key is saved straight away,
@@ -971,31 +1124,56 @@ export async function performUiAddAccount(options: {
     };
   }
 
+  const saveSnapshot = async (snapshot: AuthSnapshot): Promise<UiAddedAccount> => {
+    const account = await options.store.addAccountSnapshot(name, snapshot, {
+      force: options.force === true,
+    });
+    return {
+      name: account.name,
+      auth_mode: account.auth_mode,
+      account_id: account.account_id,
+    };
+  };
+
+  if (options.method === "browser") {
+    if (!options.authLogin?.startBrowserLogin) {
+      throw new Error("当前控制台没有可用的浏览器回调登录能力，请在终端执行 codexm add。");
+    }
+
+    const session = await options.authLogin.startBrowserLogin();
+    const flow = await options.flows.start({
+      name,
+      wait: session.wait(),
+      cancel: () => session.cancel("已取消添加账号。"),
+      complete: saveSnapshot,
+      debugLog: options.debugLog,
+    });
+
+    return {
+      status: "pending",
+      mode: "browser",
+      message: `请在浏览器中打开授权链接完成 ChatGPT 登录（回调地址 ${session.redirectUri}），等待确认。`,
+      flowId: flow.id,
+      authorizeUrl: session.authorizeUrl,
+    };
+  }
+
   if (!options.authLogin?.startDeviceLogin) {
     throw new Error("当前控制台没有可用的设备码登录能力，请在终端执行 codexm add。");
   }
 
   const session = await options.authLogin.startDeviceLogin();
-  const wait = session.wait();
   const flow = await options.flows.start({
     name,
-    session,
-    wait,
+    wait: session.wait(),
+    cancel: () => session.cancel("已取消添加账号。"),
+    complete: saveSnapshot,
     debugLog: options.debugLog,
-    complete: async (snapshot) => {
-      const account = await options.store.addAccountSnapshot(name, snapshot, {
-        force: options.force === true,
-      });
-      return {
-        name: account.name,
-        auth_mode: account.auth_mode,
-        account_id: account.account_id,
-      };
-    },
   });
 
   return {
     status: "pending",
+    mode: "device",
     message: `请在浏览器中打开 ${session.verificationUrl} 并输入设备码 ${session.userCode}，等待确认。`,
     flowId: flow.id,
     userCode: session.userCode,
@@ -1085,7 +1263,8 @@ export async function handleUiCommand(options: {
             authLogin: options.authLogin,
             flows: accountAddFlows,
             name: typeof body.name === "string" ? body.name : "",
-            method: body.method === "apikey" ? "apikey" : "device",
+            method:
+              body.method === "apikey" || body.method === "browser" ? body.method : "device",
             apiKey: typeof body.apiKey === "string" ? body.apiKey : undefined,
             force: body.force === true,
             debugLog: options.debugLog,

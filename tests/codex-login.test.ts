@@ -1,10 +1,15 @@
 import type { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { createServer } from "node:http";
 import { PassThrough } from "node:stream";
 
 import { describe, expect, test } from "@rstest/core";
 
-import { createCodexLoginProvider, startCodexDeviceLogin } from "../src/codex-login.js";
+import {
+  createCodexLoginProvider,
+  startCodexBrowserLogin,
+  startCodexDeviceLogin,
+} from "../src/codex-login.js";
 import { createAuthPayload, jsonResponse, textResponse } from "./test-helpers.js";
 
 function captureWritable(): {
@@ -21,6 +26,25 @@ function captureWritable(): {
     stream: stream as unknown as NodeJS.WriteStream,
     read: () => output,
   };
+}
+
+/** Reserves a free loopback port so callback tests never collide with port 1455. */
+async function reserveLoopbackPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+  });
+
+  if (port === 0) {
+    throw new Error("Failed to reserve a loopback port for the callback test.");
+  }
+
+  return port;
 }
 
 describe("Codex login provider", () => {
@@ -285,5 +309,55 @@ describe("Codex login provider", () => {
     setTimeout(() => session.cancel("stopped by test"), 10);
 
     await expect(waiting).rejects.toThrow("stopped by test");
+  });
+
+  test("completes a browser login when the operator returns to the callback port", async () => {
+    const auth = createAuthPayload("acct-browser-session", "chatgpt", "plus", "user-browser-session");
+    const fetchMock: typeof fetch = async (input) => {
+      const url = String(input);
+
+      if (url.endsWith("/oauth/token")) {
+        return jsonResponse({
+          id_token: auth.tokens?.id_token,
+          access_token: auth.tokens?.access_token,
+          refresh_token: auth.tokens?.refresh_token,
+        });
+      }
+
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const port = await reserveLoopbackPort();
+    const session = await startCodexBrowserLogin(fetchMock, { port });
+    expect(session.redirectUri).toBe(`http://localhost:${port}/auth/callback`);
+
+    const state = new URL(session.authorizeUrl).searchParams.get("state") ?? "";
+    const callback = await fetch(
+      `http://127.0.0.1:${port}/auth/callback?code=browser-code&state=${encodeURIComponent(state)}`,
+    );
+    expect(callback.status).toBe(200);
+
+    const snapshot = await session.wait();
+    expect(snapshot).toMatchObject({
+      auth_mode: "chatgpt",
+      tokens: {
+        account_id: "acct-browser-session",
+      },
+    });
+  });
+
+  test("releases the callback port when a browser login is cancelled", async () => {
+    const fetchMock: typeof fetch = async () => jsonResponse({});
+    const port = await reserveLoopbackPort();
+
+    const session = await startCodexBrowserLogin(fetchMock, { port });
+    const waiting = session.wait();
+    session.cancel("stopped by test");
+
+    await expect(waiting).rejects.toThrow("stopped by test");
+
+    const restarted = await startCodexBrowserLogin(fetchMock, { port });
+    restarted.cancel("cleanup");
+    await expect(restarted.wait()).rejects.toThrow("cleanup");
   });
 });
