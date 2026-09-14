@@ -8,6 +8,7 @@
     { "flag": "--debug", "description": "enable debug logging", "global": true, "aliases": ["-d"] },
     { "flag": "--accounts", "description": "print saved account names for shell completion", "global": false },
     { "flag": "--account", "description": "run codex with a saved account snapshot in an isolated runtime", "global": false, "takesValue": true },
+    { "flag": "--as", "description": "use a different account name on the registry remote or locally", "global": false, "takesValue": true },
     { "flag": "--auto", "description": "switch to the best available account", "global": false, "aliases": ["-a"] },
     { "flag": "--device-auth", "description": "add account with device-code login", "global": false },
     { "flag": "--dry-run", "description": "show the selected account without switching", "global": false, "aliases": ["-n"] },
@@ -22,6 +23,8 @@
     { "flag": "--port", "description": "set the local proxy port", "global": false, "takesValue": true },
     { "flag": "--proxy", "description": "run codex with an isolated synthetic proxy auth", "global": false },
     { "flag": "--refresh", "description": "refresh quota data before printing", "global": false },
+    { "flag": "--remote", "description": "select a configured account registry remote", "global": false, "takesValue": true },
+    { "flag": "--token", "description": "bearer token for the registry remote", "global": false, "takesValue": true },
     { "flag": "--usage-window", "description": "select the embedded usage summary window", "global": false, "takesValue": true },
     { "flag": "--verbose", "description": "show expanded score inputs and diagnostics", "global": false, "aliases": ["-v"] },
     { "flag": "--window", "description": "select the usage summary window", "global": false, "takesValue": true },
@@ -207,11 +210,39 @@
       }
     },
     {
+      "name": "remote",
+      "flags": ["--remote", "--token", "--as", "--force", "--json"],
+      "helpUsages": [
+        "codexm remote add <name> <url> --token <token>",
+        "codexm remote remove <name>",
+        "codexm remote list",
+        "codexm remote accounts [--remote <name>]",
+        "codexm remote sync [--remote <name>] [--force]",
+        "codexm remote push [account] [--remote <name>] [--as <name>] [--force]",
+        "codexm remote pull <account> [--remote <name>] [--as <name>] [--force]",
+        "codexm remote delete <account> [--remote <name>]"
+      ],
+      "usageErrors": {
+        "default": "codexm remote <add|remove|list|accounts|sync|push|pull|delete> ...",
+        "add": "codexm remote add <name> <url> --token <token>",
+        "push": "codexm remote push [account] [--remote <name>] [--as <name>] [--force]",
+        "pull": "codexm remote pull <account> [--remote <name>] [--as <name>] [--force]"
+      }
+    },
+    {
       "name": "tui",
       "flags": [],
       "helpUsages": ["codexm tui [query]"],
       "usageErrors": {
         "default": "codexm tui [query]"
+      }
+    },
+    {
+      "name": "ui",
+      "flags": ["--port", "--no-open"],
+      "helpUsages": ["codexm ui [--port <port>] [--no-open]"],
+      "usageErrors": {
+        "default": "codexm ui [--port <port>] [--no-open]"
       }
     },
     {

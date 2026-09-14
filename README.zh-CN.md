@@ -208,6 +208,29 @@ Usage 7d: in 182k/$0.42 | out 96k/$0.71 | total 278k/$1.13
 
 对于 ChatGPT 登录快照，如果本地 token 能区分同一 ChatGPT 账号或 workspace 下的不同用户，`codex-team` 也可以把它们保存成不同的托管条目。
 
+## 多机共享账号
+
+把登录快照集中存到一个轻量 registry 服务里，另一台机器就能直接拉取同一个账号，而不用重新登录。服务端的启动方式见 [server-python/README.md](./server-python/README.md)。
+
+```bash
+# 每台机器执行一次
+codexm remote add home http://127.0.0.1:8787 --token <token>
+
+codexm remote accounts        # 查看 registry 上有哪些账号
+codexm remote push            # 上传当前正在使用的账号
+codexm remote pull jsunhj     # 下载某个账号并切换过去
+codexm remote sync            # 只上传比 registry 上更新的账号
+```
+
+`remote sync` 会比较 token 的过期时间，跳过 registry 上已经同样新或更新的账号，避免一台旧机器把另一台刚刷新过的 token 覆盖回旧版本。
+
+如果想在浏览器里查看和切换这些账号，可以启动控制台。它只监听本机回环地址，并且必须带上启动 URL 里输出的一次性 token：
+
+```bash
+codexm ui                     # 打开 http://127.0.0.1:<port>/?token=...
+codexm ui --port 8899 --no-open
+```
+
 ## Shell Completion
 
 <!-- GENERATED:SHELL_COMPLETION:START -->

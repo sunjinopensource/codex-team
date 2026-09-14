@@ -209,6 +209,29 @@ In a TTY, plain `codexm` opens the dashboard directly. For the full keymap, prom
 
 For ChatGPT auth snapshots, `codex-team` can save and switch different users under the same ChatGPT account or workspace as separate managed entries when the local login tokens distinguish them.
 
+## Share accounts across machines
+
+Keep a copy of every login in a small registry server so another machine can pull the same account instead of signing in again. See [server-python/README.md](./server-python/README.md) for running the server.
+
+```bash
+# once per machine
+codexm remote add home http://127.0.0.1:8787 --token <token>
+
+codexm remote accounts        # what the registry is holding
+codexm remote push            # upload the account you are using now
+codexm remote pull jsunhj     # download an account and switch to it
+codexm remote sync            # upload anything newer than the registry copy
+```
+
+`remote sync` compares token expiry and skips accounts whose registry copy is already at least as fresh, so a stale machine can never rewind a token another one just refreshed.
+
+For a browser view of the same accounts, start the console. It listens on loopback only and requires the one-shot token printed in the URL:
+
+```bash
+codexm ui                     # opens http://127.0.0.1:<port>/?token=...
+codexm ui --port 8899 --no-open
+```
+
 ## Shell completion
 
 <!-- GENERATED:SHELL_COMPLETION:START -->

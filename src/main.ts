@@ -54,6 +54,7 @@ import {
   handleUnprotectCommand,
   handleUpdateCommand,
 } from "./commands/account-management.js";
+import { handleRemoteCommand } from "./commands/remote.js";
 import {
   handleExportCommand,
   handleImportCommand,
@@ -69,6 +70,7 @@ import { handleAutoswitchCommand } from "./commands/autoswitch.js";
 import { handleUsageCommand } from "./commands/usage.js";
 import { performManualSwitch } from "./commands/switch.js";
 import { handleTuiCommand } from "./commands/tui.js";
+import { handleUiCommand } from "./commands/ui.js";
 import {
   handleLaunchCommand,
   handleWatchCommand,
@@ -648,6 +650,28 @@ export async function runCli(
           positionals: parsed.positionals,
           json,
           stdout: streams.stdout,
+          debugLog,
+        });
+      }
+
+      case "remote": {
+        return await handleRemoteCommand({
+          positionals: parsed.positionals,
+          optionValues: parsed.optionValues,
+          flags: parsed.flags,
+          json,
+          store,
+          stdout: streams.stdout,
+          debugLog,
+        });
+      }
+
+      case "ui": {
+        return await handleUiCommand({
+          store,
+          stdout: streams.stdout,
+          portOption: parsed.optionValues.get("--port") ?? null,
+          noOpen: parsed.flags.has("--no-open"),
           debugLog,
         });
       }
