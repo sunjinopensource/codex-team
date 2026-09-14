@@ -671,6 +671,7 @@ export async function runCli(
           store,
           stdout: streams.stdout,
           desktopLauncher,
+          authLogin,
           portOption: parsed.optionValues.get("--port") ?? null,
           noOpen: parsed.flags.has("--no-open"),
           tray: parsed.flags.has("--tray"),

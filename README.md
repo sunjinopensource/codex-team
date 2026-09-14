@@ -235,7 +235,9 @@ codexm ui --tray              # keep it in the Windows system tray instead of op
 
 `--tray` keeps the console resident in the Windows system tray: left-click opens the console, right-click offers refresh, sync, and quit. On macOS and Linux it falls back to the normal console.
 
-Switching accounts from the console follows the same contract as `codexm switch`: local auth moves first, then a Desktop started by `codexm launch` is refreshed in place. A Codex Desktop that codexm did not start keeps its previous login state — the console surfaces that as a warning instead of restarting it. While proxy mode is active, a switch only moves the proxy upstream, so requests use the new account immediately and no Desktop refresh is attempted.
+Switching accounts from the console follows the same contract as `codexm switch`: local auth moves first, then a Desktop started by `codexm launch` picks up the new account — refreshed in place where DevTools allow it, and on Windows (where Codex Desktop ignores the debugging port) by restarting the codexm-managed session. A Codex Desktop that codexm did not start keeps its previous login state — the console surfaces that as a warning instead of restarting it. While proxy mode is active, a switch only moves the proxy upstream, so requests use the new account immediately and no Desktop refresh is attempted.
+
+**Add account** in the console header adds a managed snapshot without touching current auth: pick device-code login to get a code plus the OpenAI authorization page (the console polls until you approve it), or paste an API key. Overwriting an existing name asks for confirmation first.
 
 When you want a real app restart instead of an in-place refresh, use **Restart Desktop** in the console header or the tray menu. It quits Codex Desktop and launches it again so the app re-reads the current auth. If the running Desktop was not started by `codexm launch`, the console asks for confirmation first — closing it can discard unsaved sessions; the tray menu treats the click itself as that confirmation.
 

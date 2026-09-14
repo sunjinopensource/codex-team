@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { describe, expect, test } from "@rstest/core";
 
 import { createAccountStore } from "../src/account-store/index.js";
+import type { ManagedCodexDesktopState } from "../src/desktop/launcher.js";
 import {
+  NON_MANAGED_DESKTOP_WARNING_PREFIX,
   refreshManagedDesktopAfterSwitch,
   tryAcquireSwitchLock,
 } from "../src/switching.js";
@@ -73,6 +75,7 @@ describe("switching lock", () => {
         onStatusMessage: (message) => {
           messages.push(message);
         },
+        platform: "darwin",
       },
     );
 
@@ -108,6 +111,7 @@ describe("switching lock", () => {
       }),
       {
         desiredDesktopApiBaseUrl: "http://127.0.0.1:14555/backend-api",
+        platform: "darwin",
       },
     );
 
@@ -141,11 +145,116 @@ describe("switching lock", () => {
       }),
       {
         desiredDesktopApiBaseUrl: null,
+        platform: "darwin",
       },
     );
 
     expect(outcome).toBe("applied");
     expect(applyManagedSwitchCalls).toBe(1);
     expect(warnings).toHaveLength(0);
+  });
+});
+
+describe("switching on Windows", () => {
+  const windowsAppPath = "C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.2.3_x64__pub\\app";
+  const windowsManagedState: ManagedCodexDesktopState = {
+    pid: 4242,
+    app_path: windowsAppPath,
+    remote_debugging_port: 9223,
+    managed_by_codexm: true,
+    started_at: "2026-01-01T00:00:00.000Z",
+  };
+
+  function createWindowsLauncherStub(calls: {
+    quit: number;
+    launch: number;
+    writeState: number;
+    apply: number;
+  }) {
+    return createDesktopLauncherStub({
+      supportsManagedSwitchHotApply: false,
+      listRunningApps: async () => [
+        { pid: 4242, command: `${windowsAppPath}\\ChatGPT.exe` },
+      ],
+      readManagedState: async () => windowsManagedState,
+      isRunningInsideDesktopShell: async () => false,
+      quitRunningApps: async () => {
+        calls.quit += 1;
+      },
+      launch: async () => {
+        calls.launch += 1;
+      },
+      writeManagedState: async () => {
+        calls.writeState += 1;
+      },
+      applyManagedSwitch: async () => {
+        calls.apply += 1;
+        return false;
+      },
+    });
+  }
+
+  test("restarts a codexm-managed Windows Desktop because DevTools hot-refresh is unavailable there", async () => {
+    const calls = { quit: 0, launch: 0, writeState: 0, apply: 0 };
+
+    const outcome = await refreshManagedDesktopAfterSwitch(
+      [],
+      createWindowsLauncherStub(calls),
+      { platform: "win32" },
+    );
+
+    expect(outcome).toBe("restarted");
+    expect(calls.quit).toBe(1);
+    expect(calls.launch).toBe(1);
+    expect(calls.writeState).toBe(1);
+    expect(calls.apply).toBe(0);
+  });
+
+  test("warns instead of restarting a Windows Desktop codexm did not start", async () => {
+    const warnings: string[] = [];
+    const calls = { quit: 0, launch: 0, writeState: 0, apply: 0 };
+    const launcher = createDesktopLauncherStub({
+      supportsManagedSwitchHotApply: false,
+      listRunningApps: async () => [
+        { pid: 4242, command: `${windowsAppPath}\\ChatGPT.exe` },
+      ],
+      readManagedState: async () => null,
+      isRunningInsideDesktopShell: async () => false,
+      quitRunningApps: async () => {
+        calls.quit += 1;
+      },
+      launch: async () => {
+        calls.launch += 1;
+      },
+    });
+
+    const outcome = await refreshManagedDesktopAfterSwitch(warnings, launcher, {
+      platform: "win32",
+    });
+
+    expect(outcome).toBe("other-running");
+    expect(calls.quit).toBe(0);
+    expect(calls.launch).toBe(0);
+    expect(warnings).toContain(NON_MANAGED_DESKTOP_WARNING_PREFIX);
+  });
+
+  test("reports none when no Windows Desktop is running", async () => {
+    const calls = { quit: 0, launch: 0, writeState: 0, apply: 0 };
+    const launcher = createDesktopLauncherStub({
+      supportsManagedSwitchHotApply: false,
+      listRunningApps: async () => [],
+      readManagedState: async () => windowsManagedState,
+      applyManagedSwitch: async () => {
+        calls.apply += 1;
+        return false;
+      },
+    });
+
+    const outcome = await refreshManagedDesktopAfterSwitch([], launcher, {
+      platform: "win32",
+    });
+
+    expect(outcome).toBe("none");
+    expect(calls.apply).toBe(0);
   });
 });

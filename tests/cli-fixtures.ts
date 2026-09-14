@@ -51,6 +51,7 @@ export function createDesktopLauncherStub(overrides: Partial<{
   readManagedCurrentQuota: () => Promise<ManagedCurrentQuotaSnapshot | null>;
   refreshManagedAccountSurface: () => Promise<boolean>;
   isRunningInsideDesktopShell: () => Promise<boolean>;
+  supportsManagedSwitchHotApply: boolean;
   applyManagedSwitch: (options?: {
     force?: boolean;
     timeoutMs?: number;
@@ -160,6 +161,7 @@ export function createDesktopLauncherStub(overrides: Partial<{
     refreshManagedAccountSurface:
       overrides.refreshManagedAccountSurface ?? (async () => false),
     isRunningInsideDesktopShell: overrides.isRunningInsideDesktopShell ?? (async () => false),
+    supportsManagedSwitchHotApply: overrides.supportsManagedSwitchHotApply ?? true,
     applyManagedSwitch: overrides.applyManagedSwitch ?? (async () => false),
     watchManagedQuotaSignals: overrides.watchManagedQuotaSignals ?? (async () => undefined),
   };

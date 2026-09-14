@@ -18,8 +18,24 @@ export interface CodexLoginRequest {
   stderr: NodeJS.WriteStream;
 }
 
+/**
+ * A started device-code login. Surfaces that cannot block on the operator (the
+ * web console) read the code first, then poll `wait()` until the operator
+ * approves it in a browser.
+ */
+export interface CodexDeviceLoginSession {
+  userCode: string;
+  verificationUrl: string;
+  intervalMs: number;
+  wait(): Promise<AuthSnapshot>;
+  /** Abandons the flow; a pending `wait()` rejects instead of polling forever. */
+  cancel(reason?: string): void;
+}
+
 export interface CodexLoginProvider {
   login(request: CodexLoginRequest): Promise<AuthSnapshot>;
+  /** Optional: only providers that can drive the device flow expose it. */
+  startDeviceLogin?(): Promise<CodexDeviceLoginSession>;
 }
 
 interface TokenExchangeResponse {
@@ -286,6 +302,135 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const CODEX_DEVICE_VERIFICATION_URL = `${CODEX_AUTH_BASE_URL}/codex/device`;
+
+async function requestDeviceUserCode(fetchImpl: typeof fetch): Promise<{
+  userCode: string;
+  deviceAuthId: string;
+  intervalMs: number;
+}> {
+  const userCodeResponse = await fetchImpl(`${CODEX_AUTH_BASE_URL}/api/accounts/deviceauth/usercode`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ client_id: CODEX_CLIENT_ID }),
+  });
+  const deviceCode = await readJsonResponse<DeviceUserCodeResponse>(
+    userCodeResponse,
+    "Codex device code request",
+  );
+  const userCode = (deviceCode.user_code ?? deviceCode.usercode ?? "").trim();
+  const deviceAuthId = (deviceCode.device_auth_id ?? "").trim();
+  if (!userCode || !deviceAuthId) {
+    throw new Error("Codex device code response is missing required fields.");
+  }
+
+  return {
+    userCode,
+    deviceAuthId,
+    intervalMs: parseDeviceInterval(deviceCode.interval) * 1000,
+  };
+}
+
+/**
+ * Starts (but does not await) a device-code login, so callers can show the code
+ * before the operator has approved anything.
+ */
+export async function startCodexDeviceLogin(
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<CodexDeviceLoginSession> {
+  const { userCode, deviceAuthId, intervalMs } = await requestDeviceUserCode(fetchImpl);
+  const cancelListeners = new Set<(error: Error) => void>();
+  let cancellation: Error | null = null;
+
+  const waitForCancellation = (): Promise<never> =>
+    new Promise((_, reject) => {
+      if (cancellation) {
+        reject(cancellation);
+        return;
+      }
+      cancelListeners.add(reject);
+    });
+
+  const sleepOrCancel = async (ms: number): Promise<void> => {
+    await Promise.race([sleep(ms), waitForCancellation()]);
+    if (cancellation) {
+      throw cancellation;
+    }
+  };
+
+  const wait = async (): Promise<AuthSnapshot> => {
+    const deadline = Date.now() + DEVICE_LOGIN_TIMEOUT_MS;
+    let tokenResponse: DeviceTokenResponse | null = null;
+
+    while (Date.now() < deadline) {
+      if (cancellation) {
+        throw cancellation;
+      }
+
+      const response = await fetchImpl(`${CODEX_AUTH_BASE_URL}/api/accounts/deviceauth/token`, {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          device_auth_id: deviceAuthId,
+          user_code: userCode,
+        }),
+      });
+
+      if (response.ok) {
+        tokenResponse = await response.json() as DeviceTokenResponse;
+        break;
+      }
+
+      if (response.status !== 403 && response.status !== 404) {
+        const body = await response.text();
+        throw new Error(`Codex device token polling failed with status ${response.status}: ${body.trim() || "empty response"}`);
+      }
+
+      await sleepOrCancel(intervalMs);
+    }
+
+    if (cancellation) {
+      throw cancellation;
+    }
+
+    if (!tokenResponse) {
+      throw new Error("Codex device authentication timed out after 15 minutes.");
+    }
+
+    if (!tokenResponse.authorization_code || !tokenResponse.code_verifier) {
+      throw new Error("Codex device token response is missing required fields.");
+    }
+
+    const tokens = await exchangeCodeForTokens(
+      fetchImpl,
+      tokenResponse.authorization_code,
+      `${CODEX_AUTH_BASE_URL}/deviceauth/callback`,
+      tokenResponse.code_verifier,
+    );
+    return authSnapshotFromTokens(tokens);
+  };
+
+  return {
+    userCode,
+    verificationUrl: CODEX_DEVICE_VERIFICATION_URL,
+    intervalMs,
+    wait,
+    cancel: (reason?: string) => {
+      cancellation = new Error(reason ?? "Codex device login was cancelled.");
+      for (const listener of cancelListeners) {
+        listener(cancellation);
+      }
+      cancelListeners.clear();
+    },
+  };
+}
+
 export function createCodexLoginProvider(
   fetchImpl: typeof fetch = globalThis.fetch,
   options: CodexLoginProviderOptions = {},
@@ -315,72 +460,13 @@ export function createCodexLoginProvider(
         return authSnapshotFromTokens(tokens);
       }
 
-      const userCodeResponse = await fetchImpl(`${CODEX_AUTH_BASE_URL}/api/accounts/deviceauth/usercode`, {
-        method: "POST",
-        headers: {
-          accept: "application/json",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ client_id: CODEX_CLIENT_ID }),
-      });
-      const deviceCode = await readJsonResponse<DeviceUserCodeResponse>(
-        userCodeResponse,
-        "Codex device code request",
-      );
-      const userCode = (deviceCode.user_code ?? deviceCode.usercode ?? "").trim();
-      const deviceAuthId = (deviceCode.device_auth_id ?? "").trim();
-      if (!userCode || !deviceAuthId) {
-        throw new Error("Codex device code response is missing required fields.");
-      }
-
+      const session = await startCodexDeviceLogin(fetchImpl);
       request.stderr.write(
-        `Open ${CODEX_AUTH_BASE_URL}/codex/device and enter code ${userCode}.\n`,
+        `Open ${session.verificationUrl} and enter code ${session.userCode}.\n`,
       );
 
-      const intervalMs = parseDeviceInterval(deviceCode.interval) * 1000;
-      const deadline = Date.now() + DEVICE_LOGIN_TIMEOUT_MS;
-      let tokenResponse: DeviceTokenResponse | null = null;
-      while (Date.now() < deadline) {
-        const response = await fetchImpl(`${CODEX_AUTH_BASE_URL}/api/accounts/deviceauth/token`, {
-          method: "POST",
-          headers: {
-            accept: "application/json",
-            "content-type": "application/json",
-          },
-          body: JSON.stringify({
-            device_auth_id: deviceAuthId,
-            user_code: userCode,
-          }),
-        });
-
-        if (response.ok) {
-          tokenResponse = await response.json() as DeviceTokenResponse;
-          break;
-        }
-
-        if (response.status !== 403 && response.status !== 404) {
-          const body = await response.text();
-          throw new Error(`Codex device token polling failed with status ${response.status}: ${body.trim() || "empty response"}`);
-        }
-
-        await sleep(intervalMs);
-      }
-
-      if (!tokenResponse) {
-        throw new Error("Codex device authentication timed out after 15 minutes.");
-      }
-
-      if (!tokenResponse.authorization_code || !tokenResponse.code_verifier) {
-        throw new Error("Codex device token response is missing required fields.");
-      }
-
-      const tokens = await exchangeCodeForTokens(
-        fetchImpl,
-        tokenResponse.authorization_code,
-        `${CODEX_AUTH_BASE_URL}/deviceauth/callback`,
-        tokenResponse.code_verifier,
-      );
-      return authSnapshotFromTokens(tokens);
+      return await session.wait();
     },
+    startDeviceLogin: () => startCodexDeviceLogin(fetchImpl),
   };
 }

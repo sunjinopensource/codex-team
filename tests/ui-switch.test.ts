@@ -4,6 +4,7 @@ import { createAccountStore } from "../src/account-store/index.js";
 import { performUiSwitch } from "../src/commands/ui.js";
 import type { CodexDesktopLauncher } from "../src/desktop/launcher.js";
 import { NON_MANAGED_DESKTOP_WARNING_PREFIX } from "../src/switching.js";
+import { createDesktopLauncherStub } from "./cli-fixtures.js";
 import { cleanupTempHome, createTempHome, writeCurrentAuth } from "./test-helpers.js";
 
 interface FakeLauncherCalls {
@@ -50,7 +51,12 @@ describe("console switch", () => {
       const store = await seedAccounts(homeDir);
       const { launcher, calls } = createFakeLauncher({ applyResult: true });
 
-      const result = await performUiSwitch({ store, name: "beta", desktopLauncher: launcher });
+      const result = await performUiSwitch({
+        store,
+        name: "beta",
+        desktopLauncher: launcher,
+        platform: "darwin",
+      });
 
       expect(result.desktop_refresh).toBe("applied");
       expect(result.proxy_retained).toBe(false);
@@ -73,7 +79,12 @@ describe("console switch", () => {
         runningApps: [{ pid: 4242 }],
       });
 
-      const result = await performUiSwitch({ store, name: "beta", desktopLauncher: launcher });
+      const result = await performUiSwitch({
+        store,
+        name: "beta",
+        desktopLauncher: launcher,
+        platform: "darwin",
+      });
 
       expect(result.desktop_refresh).toBe("other-running");
       expect(calls.apply).toBe(1);
@@ -95,6 +106,61 @@ describe("console switch", () => {
       const result = await performUiSwitch({ store, name: "beta" });
 
       expect(result.desktop_refresh).toBe("skipped-no-launcher");
+
+      const status = await store.getCurrentStatus();
+      expect(status.matched_accounts).toContain("beta");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("restarts a managed Windows Desktop because DevTools hot-refresh is unavailable there", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = await seedAccounts(homeDir);
+      const windowsAppPath = "C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.2.3_x64__pub\\app";
+      const calls = { quit: 0, launch: 0, writeState: 0, apply: 0 };
+      const launcher = createDesktopLauncherStub({
+        supportsManagedSwitchHotApply: false,
+        listRunningApps: async () => [
+          { pid: 4242, command: `${windowsAppPath}\\ChatGPT.exe` },
+        ],
+        readManagedState: async () => ({
+          pid: 4242,
+          app_path: windowsAppPath,
+          remote_debugging_port: 9223,
+          managed_by_codexm: true,
+          started_at: "2026-01-01T00:00:00.000Z",
+        }),
+        isRunningInsideDesktopShell: async () => false,
+        quitRunningApps: async () => {
+          calls.quit += 1;
+        },
+        launch: async () => {
+          calls.launch += 1;
+        },
+        writeManagedState: async () => {
+          calls.writeState += 1;
+        },
+        applyManagedSwitch: async () => {
+          calls.apply += 1;
+          return false;
+        },
+      });
+
+      const result = await performUiSwitch({
+        store,
+        name: "beta",
+        desktopLauncher: launcher,
+        platform: "win32",
+      });
+
+      expect(result.desktop_refresh).toBe("restarted");
+      expect(result.message).toContain("已重启受管的 Codex Desktop 会话");
+      expect(calls.quit).toBe(1);
+      expect(calls.launch).toBe(1);
+      expect(calls.apply).toBe(0);
 
       const status = await store.getCurrentStatus();
       expect(status.matched_accounts).toContain("beta");

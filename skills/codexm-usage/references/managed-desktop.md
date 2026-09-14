@@ -20,6 +20,7 @@
 - `codexm switch --force` skips that wait and applies the change immediately.
 - Restarting the managed Codex app server interrupts the current managed Desktop thread.
 - The managed Desktop refresh path is intentionally narrow: it refreshes auth/account state by restarting the Codex app server, and does not hot-swap Desktop main-process fetch base URLs.
+- On Windows, Codex Desktop ignores `--remote-debugging-port`, so there is no DevTools session to hot-apply switches against. When a codexm-managed Desktop is running, `codexm switch` and the console switch restart that managed session to apply the new account; a Desktop codexm did not start still only gets a warning. `codexm launch` on Windows records managed state so later switches can tell the managed session apart from a hand-started one.
 
 ## proxy account
 

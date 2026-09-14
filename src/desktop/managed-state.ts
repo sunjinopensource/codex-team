@@ -161,7 +161,7 @@ export async function resolveManagedDesktopState(
 }
 
 export const WINDOWS_DESKTOP_NO_DEVTOOLS_WARNING =
-  "Codex Desktop on Windows ignores --remote-debugging-port, so codexm launched it without managed-session tracking.";
+  "Codex Desktop on Windows ignores --remote-debugging-port, so codexm could not track the new session; account switches may not apply to it automatically.";
 export const DESKTOP_SURFACE_REFRESH_FAILED_WARNING =
   "Codex Desktop launched, but codexm could not refresh the in-app account surface yet.";
 
@@ -236,7 +236,22 @@ export async function restartManagedDesktopSession(options: {
 
   if (platform === "win32") {
     await desktopLauncher.launch(appPath, { apiBaseUrl: options.desktopApiBaseUrl });
-    warnings.push(WINDOWS_DESKTOP_NO_DEVTOOLS_WARNING);
+    // Windows Desktop ignores --remote-debugging-port, so there is no DevTools
+    // session to hand over. Track the new process by pid so later switches and
+    // restarts can tell it apart from a Desktop the operator started by hand.
+    const managedState = await resolveManagedDesktopState(
+      desktopLauncher,
+      appPath,
+      runningApps,
+      platform,
+      { desktopApiBaseUrl: options.desktopApiBaseUrl },
+    );
+    if (managedState) {
+      await desktopLauncher.writeManagedState(managedState);
+    } else {
+      await desktopLauncher.clearManagedState().catch(() => undefined);
+      warnings.push(WINDOWS_DESKTOP_NO_DEVTOOLS_WARNING);
+    }
     return {
       outcome: runningApps.length > 0 ? "relaunched" : "started",
       warnings,

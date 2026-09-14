@@ -8,6 +8,7 @@ import { FILE_MODE } from "../account-store/storage.js";
 import { writeJson } from "../cli/output.js";
 import { getUsage } from "../cli/spec.js";
 import {
+  RegistryConflictError,
   addRemote,
   deleteRemoteAccount,
   downloadBundle,
@@ -187,7 +188,16 @@ export async function handleRemoteCommand(options: {
           outputPath: bundlePath,
           force: true,
         });
-        await uploadBundle(config, targetName, bundle);
+        await uploadBundle(config, targetName, bundle, { force });
+      } catch (error) {
+        if (error instanceof RegistryConflictError) {
+          throw new Error(
+            `Registry "${name}" holds a newer copy of "${targetName}" (${
+              error.reason ?? "stale"
+            }). Run \`codexm remote pull ${targetName}\` first, or re-run with --force to overwrite.`,
+          );
+        }
+        throw error;
       } finally {
         await rm(bundlePath, { force: true }).catch(() => {});
       }
@@ -388,9 +398,19 @@ export async function syncAccountsToRemote(options: {
         outputPath: bundlePath,
         force: true,
       });
-      await uploadBundle(config, account.name, bundle);
+      await uploadBundle(config, account.name, bundle, { force: force === true });
       results.push({ name: account.name, status: "pushed" });
     } catch (error) {
+      if (error instanceof RegistryConflictError) {
+        // Lost a race with another machine: adopting its copy on the next
+        // pass is the right move, so this is a skip, not a failure.
+        results.push({
+          name: account.name,
+          status: "skipped",
+          reason: error.reason ?? "registry holds a newer token",
+        });
+        continue;
+      }
       results.push({
         name: account.name,
         status: "failed",

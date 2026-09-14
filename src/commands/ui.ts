@@ -3,16 +3,20 @@ import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 import type { AccountStore } from "../account-store/index.js";
+import { ensureAccountName } from "../account-store/storage.js";
+import type { AuthSnapshot } from "../auth-snapshot.js";
 import { runAuthRefreshSweep } from "../auth-refresh.js";
+import type { CodexDeviceLoginSession, CodexLoginProvider } from "../codex-login.js";
 import type { CodexDesktopLauncher } from "../desktop/launcher.js";
 import {
   restartManagedDesktopSession,
   type ManagedDesktopRestartOutcome,
 } from "../desktop/managed-state.js";
 import { describeDesktopNotFound } from "../desktop/shared.js";
-import { getPlatform } from "../platform.js";
+import { getPlatform, type CodexmPlatform } from "../platform.js";
+import { ensureNotReservedProxyAccountName } from "../proxy/constants.js";
 import { resolveManagedDesktopApiBaseUrl } from "../proxy/runtime.js";
-import { listRemoteAccounts, resolveRemote } from "../registry/client.js";
+import { listRemoteAccounts, readRemotesFile, resolveRemote } from "../registry/client.js";
 import {
   describeBusySwitchLock,
   refreshManagedDesktopAfterSwitch,
@@ -22,6 +26,12 @@ import {
 } from "../switching.js";
 import { isTraySupported, startTray, type TrayAction, type TrayHost } from "../tray/index.js";
 import { syncAccountsToRemote } from "./remote.js";
+import {
+  resolveRegistryClientId,
+  runAutoSyncLoop,
+  runAutoSyncOnce,
+  type AutoSyncRunResult,
+} from "./autosync.js";
 
 type DebugLogger = (message: string) => void;
 
@@ -112,6 +122,25 @@ function renderPage(): string {
   .toast.error { border-left-color: var(--hot); }
   .toast.good { border-left-color: var(--ok); }
   .toast.warn { border-left-color: var(--warn); }
+  .modal { position: fixed; inset: 0; background: rgba(3,6,12,.72); display: grid; place-items: center; z-index: 20; padding: 20px; }
+  .modal.hidden { display: none; }
+  .modal-card {
+    width: min(440px, 100%); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 20px; display: grid; gap: 14px;
+  }
+  .modal-card h2 { margin: 0; font-size: 15px; }
+  .field { display: grid; gap: 6px; }
+  .field label { color: var(--muted); font-size: 12px; }
+  input, select {
+    background: #0c121c; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 11px; font-size: 13px; width: 100%;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .code {
+    font-size: 24px; letter-spacing: 3px; font-weight: 650; text-align: center;
+    padding: 10px; background: #0c121c; border: 1px solid var(--line); border-radius: 10px;
+  }
 </style>
 </head>
 <body>
@@ -119,6 +148,7 @@ function renderPage(): string {
   <h1>codexm <span>控制台</span></h1>
   <div class="meta" id="meta">加载中…</div>
   <div class="spacer"></div>
+  <button id="addBtn" class="primary">添加账号</button>
   <button id="relaunchBtn">重启桌面端</button>
   <button id="refreshBtn">刷新配额</button>
   <button id="syncBtn">同步到 registry</button>
@@ -126,6 +156,35 @@ function renderPage(): string {
 </header>
 <main id="grid"></main>
 <div id="toast"></div>
+<div id="addModal" class="modal hidden">
+  <div class="modal-card">
+    <h2>添加账号</h2>
+    <div class="field">
+      <label for="addName">账号名称</label>
+      <input id="addName" autocomplete="off" placeholder="例如 work-plus">
+    </div>
+    <div class="field">
+      <label for="addMethod">登录方式</label>
+      <select id="addMethod">
+        <option value="device">设备码登录（推荐）</option>
+        <option value="apikey">API key</option>
+      </select>
+    </div>
+    <div class="field" id="addKeyField" style="display:none">
+      <label for="addKey">OpenAI API key</label>
+      <input id="addKey" type="password" autocomplete="off" placeholder="sk-...">
+    </div>
+    <div class="field" id="addCodeField" style="display:none">
+      <label>在浏览器打开 <a id="addVerifyLink" href="#" target="_blank" rel="noreferrer">授权页面</a> 并输入下面的设备码</label>
+      <div class="code" id="addCode">…</div>
+      <div class="sub" id="addStatus">等待确认…</div>
+    </div>
+    <div class="modal-actions">
+      <button id="addCancelBtn">取消</button>
+      <button id="addSubmitBtn" class="primary">开始</button>
+    </div>
+  </div>
+</div>
 <script>
   const token = new URLSearchParams(location.search).get("token") || "";
   const grid = document.getElementById("grid");
@@ -148,7 +207,8 @@ function renderPage(): string {
   }
 
   function api(path, method, body) {
-    return fetch(path + "?token=" + encodeURIComponent(token), {
+    // Paths may already carry a query (status polling passes flowId).
+    return fetch(path + (path.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(token), {
       method: method || "GET",
       headers: body ? { "content-type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined,
@@ -196,7 +256,7 @@ function renderPage(): string {
       (state.warnings && state.warnings.length ? " · " + state.warnings.length + " 条警告" : "");
 
     if (!accounts.length) {
-      grid.innerHTML = '<div class="empty">还没有托管账号。用 <code>codexm save</code> 保存当前账号，或导入一个 share bundle。</div>';
+      grid.innerHTML = '<div class="empty">还没有托管账号。点右上角「添加账号」，或用 <code>codexm save</code> / <code>codexm import</code>。</div>';
       return;
     }
 
@@ -299,6 +359,139 @@ function renderPage(): string {
   document.getElementById("syncBtn").addEventListener("click", function () {
     act("/api/sync", {}, "同步完成");
   });
+  const addModal = document.getElementById("addModal");
+  const addName = document.getElementById("addName");
+  const addMethod = document.getElementById("addMethod");
+  const addKeyField = document.getElementById("addKeyField");
+  const addKey = document.getElementById("addKey");
+  const addCodeField = document.getElementById("addCodeField");
+  const addCode = document.getElementById("addCode");
+  const addStatus = document.getElementById("addStatus");
+  const addVerifyLink = document.getElementById("addVerifyLink");
+  const addSubmitBtn = document.getElementById("addSubmitBtn");
+  let addPoller = null;
+  let addFlowId = "";
+
+  function stopAddPoller() {
+    if (addPoller) {
+      clearInterval(addPoller);
+      addPoller = null;
+    }
+  }
+
+  function closeAddModal() {
+    stopAddPoller();
+    addModal.classList.add("hidden");
+  }
+
+  function openAddModal() {
+    addName.value = "";
+    addKey.value = "";
+    addMethod.value = "device";
+    addKeyField.style.display = "none";
+    addCodeField.style.display = "none";
+    addSubmitBtn.disabled = false;
+    addSubmitBtn.textContent = "开始";
+    addModal.classList.remove("hidden");
+    addName.focus();
+  }
+
+  addMethod.addEventListener("change", function () {
+    addKeyField.style.display = addMethod.value === "apikey" ? "" : "none";
+  });
+
+  document.getElementById("addBtn").addEventListener("click", openAddModal);
+
+  document.getElementById("addCancelBtn").addEventListener("click", function () {
+    if (addFlowId) {
+      api("/api/accounts/add/cancel", "POST", { flowId: addFlowId }).catch(function () {});
+    }
+    addFlowId = "";
+    closeAddModal();
+  });
+
+  async function submitAdd(force) {
+    const name = addName.value.trim();
+    if (!name) {
+      toast("请填写账号名称", "warn");
+      return;
+    }
+
+    addSubmitBtn.disabled = true;
+    try {
+      const payload = await api("/api/accounts/add", "POST", {
+        name: name,
+        method: addMethod.value,
+        apiKey: addMethod.value === "apikey" ? addKey.value.trim() : undefined,
+        force: !!force,
+      });
+
+      if (payload.requires_confirmation) {
+        if (!window.confirm(payload.message)) {
+          addSubmitBtn.disabled = false;
+          return;
+        }
+        await submitAdd(true);
+        return;
+      }
+
+      if (payload.status === "added") {
+        toast(payload.message, "good");
+        addFlowId = "";
+        closeAddModal();
+        await reload();
+        return;
+      }
+
+      addFlowId = payload.flowId;
+      addCode.textContent = payload.userCode;
+      addVerifyLink.href = payload.verificationUrl;
+      addCodeField.style.display = "";
+      addStatus.textContent = "等待浏览器确认…";
+      addSubmitBtn.textContent = "等待确认…";
+      stopAddPoller();
+      addPoller = setInterval(pollAdd, 2000);
+    } catch (error) {
+      toast(error.message, "error");
+      addSubmitBtn.disabled = false;
+    }
+  }
+
+  async function pollAdd() {
+    if (!addFlowId) return;
+
+    try {
+      const payload = await api("/api/accounts/add/status?flowId=" + encodeURIComponent(addFlowId));
+      addStatus.textContent = payload.message;
+
+      if (payload.status === "done") {
+        stopAddPoller();
+        addFlowId = "";
+        toast(payload.message, "good");
+        closeAddModal();
+        await reload();
+        return;
+      }
+
+      if (payload.status === "error") {
+        stopAddPoller();
+        addFlowId = "";
+        addSubmitBtn.disabled = false;
+        addSubmitBtn.textContent = "重试";
+        toast(payload.message, "error");
+      }
+    } catch (error) {
+      stopAddPoller();
+      addFlowId = "";
+      addSubmitBtn.disabled = false;
+      toast(error.message, "error");
+    }
+  }
+
+  addSubmitBtn.addEventListener("click", function () {
+    submitAdd(false);
+  });
+
   document.getElementById("quitBtn").addEventListener("click", async function () {
     try { await api("/api/quit", "POST", {}); } catch (error) { /* server is gone */ }
     document.body.innerHTML = '<div class="empty">控制台已停止，可以关闭此标签页。</div>';
@@ -458,6 +651,7 @@ async function waitForTrayReady(host: TrayHost, timeoutMs = 8000): Promise<boole
 
 export type UiSwitchDesktopOutcome =
   | "applied"
+  | "restarted"
   | "killed"
   | "none"
   | "other-running"
@@ -474,7 +668,8 @@ export interface UiSwitchResult {
 
 /**
  * Console switches follow the same Desktop contract as `codexm switch`: local
- * auth moves first, then a codexm-managed Desktop is refreshed in place. A
+ * auth moves first, then a codexm-managed Desktop picks the auth up — in place
+ * where DevTools allow it, by restarting the managed session on Windows. A
  * Desktop started outside codexm is never touched, so the caller surfaces a
  * warning instead of implying the running session updated.
  */
@@ -483,6 +678,8 @@ export async function performUiSwitch(options: {
   name: string;
   desktopLauncher?: CodexDesktopLauncher;
   debugLog?: DebugLogger;
+  /** Override platform detection for tests. */
+  platform?: CodexmPlatform;
 }): Promise<UiSwitchResult> {
   const lock = await tryAcquireSwitchLock(options.store, `ui switch ${options.name}`);
   if (!lock.acquired) {
@@ -517,13 +714,16 @@ export async function performUiSwitch(options: {
 
     const outcome = await refreshManagedDesktopAfterSwitch(warnings, options.desktopLauncher, {
       onStatusMessage: (message) => options.debugLog?.(`ui switch desktop: ${message}`),
+      platform: options.platform,
     });
     options.debugLog?.(`ui switch: desktop refresh outcome=${outcome}`);
 
     const message =
       outcome === "applied"
         ? `已切换到「${options.name}」，已应用到受管的 Codex Desktop 会话。`
-        : outcome === "other-running"
+        : outcome === "restarted"
+          ? `已切换到「${options.name}」，已重启受管的 Codex Desktop 会话以应用新账号。`
+          : outcome === "other-running"
           ? `已切换到「${options.name}」，但运行中的 Codex Desktop 不是 codexm 启动的，仍在使用旧登录态。`
           : outcome === "none"
             ? `已切换到「${options.name}」，当前没有运行中的 Codex Desktop。`
@@ -612,16 +812,211 @@ export async function performDesktopRelaunch(options: {
   }
 }
 
+export type UiAddAccountMethod = "device" | "apikey";
+
+export interface UiAddedAccount {
+  name: string;
+  auth_mode: string;
+  account_id?: string | null;
+}
+
+interface AccountAddFlow {
+  id: string;
+  name: string;
+  status: "pending" | "done" | "error";
+  message: string;
+  account?: UiAddedAccount;
+  cancel: () => void;
+  settled: Promise<void>;
+}
+
+/**
+ * Tracks device-code logins started from the console. A HTTP handler has to
+ * hand the code back immediately, while approval happens minutes later in the
+ * operator's browser, so the login lives here instead of in one request.
+ */
+export function createAccountAddFlows() {
+  const flows = new Map<string, AccountAddFlow>();
+
+  return {
+    async start(options: {
+      name: string;
+      session: CodexDeviceLoginSession;
+      wait: Promise<AuthSnapshot>;
+      complete: (snapshot: AuthSnapshot) => Promise<UiAddedAccount>;
+      debugLog?: DebugLogger;
+    }): Promise<AccountAddFlow> {
+      const id = randomBytes(8).toString("hex");
+      const flow: AccountAddFlow = {
+        id,
+        name: options.name,
+        status: "pending",
+        message: "等待浏览器确认…",
+        cancel: () => options.session.cancel("已取消添加账号。"),
+        settled: Promise.resolve(),
+      };
+      flows.set(id, flow);
+
+      flow.settled = options.wait.then(
+        async (snapshot) => {
+          try {
+            flow.account = await options.complete(snapshot);
+            flow.status = "done";
+            flow.message = `已添加账号「${options.name}」。`;
+            options.debugLog?.(`ui add: flow ${id} completed for ${options.name}`);
+          } catch (error) {
+            flow.status = "error";
+            flow.message = (error as Error).message;
+          }
+        },
+        (error: unknown) => {
+          flow.status = "error";
+          flow.message = (error as Error).message;
+          options.debugLog?.(`ui add: flow ${id} failed: ${flow.message}`);
+        },
+      );
+
+      return flow;
+    },
+
+    get(id: string): AccountAddFlow | undefined {
+      return flows.get(id);
+    },
+
+    /** Cancels and forgets a flow; callers only await it on shutdown. */
+    remove(id: string): void {
+      const flow = flows.get(id);
+      if (!flow) {
+        return;
+      }
+      flows.delete(id);
+    },
+
+    cancelAll(): void {
+      for (const flow of flows.values()) {
+        flow.cancel();
+      }
+      flows.clear();
+    },
+
+    /** Test hook: resolve once every started flow has settled. */
+    async settled(): Promise<void> {
+      await Promise.all([...flows.values()].map((flow) => flow.settled));
+    },
+  };
+}
+
+export type AccountAddFlows = ReturnType<typeof createAccountAddFlows>;
+
+export type UiAddAccountResult =
+  | { status: "added"; message: string; account: UiAddedAccount }
+  | {
+      status: "pending";
+      message: string;
+      flowId: string;
+      userCode: string;
+      verificationUrl: string;
+    }
+  | { status: "confirm-overwrite"; message: string };
+
+/**
+ * Adds a managed account from the console: an API key is saved straight away,
+ * while device login returns a code the operator approves in a browser. Like
+ * `codexm add`, this only writes the snapshot — it never changes current auth.
+ */
+export async function performUiAddAccount(options: {
+  store: AccountStore;
+  authLogin?: CodexLoginProvider;
+  flows: AccountAddFlows;
+  name: string;
+  method: UiAddAccountMethod;
+  apiKey?: string;
+  force?: boolean;
+  debugLog?: DebugLogger;
+}): Promise<UiAddAccountResult> {
+  const name = options.name.trim();
+  if (name === "") {
+    throw new Error("缺少账号名称");
+  }
+  ensureAccountName(name);
+  ensureNotReservedProxyAccountName(name, "name a managed account");
+
+  const { accounts } = await options.store.listAccounts();
+  if (accounts.some((account) => account.name === name) && options.force !== true) {
+    return {
+      status: "confirm-overwrite",
+      message: `已存在同名账号「${name}」。继续将覆盖它的登录态，要继续吗？`,
+    };
+  }
+
+  if (options.method === "apikey") {
+    const apiKey = (options.apiKey ?? "").trim();
+    if (apiKey === "") {
+      throw new Error("缺少 API key");
+    }
+    const account = await options.store.addAccountSnapshot(
+      name,
+      { auth_mode: "apikey", OPENAI_API_KEY: apiKey },
+      { force: options.force === true },
+    );
+    options.debugLog?.(`ui add: saved apikey account ${name}`);
+    return {
+      status: "added",
+      message: `已添加账号「${name}」（API key）。`,
+      account: {
+        name: account.name,
+        auth_mode: account.auth_mode,
+        account_id: account.account_id,
+      },
+    };
+  }
+
+  if (!options.authLogin?.startDeviceLogin) {
+    throw new Error("当前控制台没有可用的设备码登录能力，请在终端执行 codexm add。");
+  }
+
+  const session = await options.authLogin.startDeviceLogin();
+  const wait = session.wait();
+  const flow = await options.flows.start({
+    name,
+    session,
+    wait,
+    debugLog: options.debugLog,
+    complete: async (snapshot) => {
+      const account = await options.store.addAccountSnapshot(name, snapshot, {
+        force: options.force === true,
+      });
+      return {
+        name: account.name,
+        auth_mode: account.auth_mode,
+        account_id: account.account_id,
+      };
+    },
+  });
+
+  return {
+    status: "pending",
+    message: `请在浏览器中打开 ${session.verificationUrl} 并输入设备码 ${session.userCode}，等待确认。`,
+    flowId: flow.id,
+    userCode: session.userCode,
+    verificationUrl: session.verificationUrl,
+  };
+}
+
 export async function handleUiCommand(options: {
   store: AccountStore;
   stdout: NodeJS.WriteStream;
   desktopLauncher?: CodexDesktopLauncher;
+  authLogin?: CodexLoginProvider;
+  /** Device-code logins outlive a single request; injected so tests can drive them. */
+  accountAddFlows?: AccountAddFlows;
   portOption?: string | null;
   noOpen?: boolean;
   tray?: boolean;
   debugLog?: DebugLogger;
 }): Promise<number> {
   const { store, stdout } = options;
+  const accountAddFlows = options.accountAddFlows ?? createAccountAddFlows();
 
   let requestedPort = 0;
   if (options.portOption) {
@@ -683,6 +1078,51 @@ export async function handleUiCommand(options: {
           return;
         }
 
+        if (req.method === "POST" && url.pathname === "/api/accounts/add") {
+          const body = await readJsonBody(req);
+          const result = await performUiAddAccount({
+            store,
+            authLogin: options.authLogin,
+            flows: accountAddFlows,
+            name: typeof body.name === "string" ? body.name : "",
+            method: body.method === "apikey" ? "apikey" : "device",
+            apiKey: typeof body.apiKey === "string" ? body.apiKey : undefined,
+            force: body.force === true,
+            debugLog: options.debugLog,
+          });
+          sendJson(res, 200, {
+            ok: result.status !== "confirm-overwrite",
+            ...result,
+            requires_confirmation: result.status === "confirm-overwrite",
+          });
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/accounts/add/status") {
+          const flow = accountAddFlows.get(url.searchParams.get("flowId") ?? "");
+          if (!flow) {
+            sendJson(res, 404, { error: "未找到该添加流程" });
+            return;
+          }
+          sendJson(res, 200, {
+            ok: true,
+            status: flow.status,
+            message: flow.message,
+            account: flow.account ?? null,
+          });
+          if (flow.status !== "pending") {
+            accountAddFlows.remove(flow.id);
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/accounts/add/cancel") {
+          const body = await readJsonBody(req);
+          accountAddFlows.get(typeof body.flowId === "string" ? body.flowId : "")?.cancel();
+          sendJson(res, 200, { ok: true, message: "已取消添加账号。" });
+          return;
+        }
+
         if (req.method === "POST" && url.pathname === "/api/desktop/relaunch") {
           const body = await readJsonBody(req);
           const result = await performDesktopRelaunch({
@@ -720,6 +1160,21 @@ export async function handleUiCommand(options: {
           return;
         }
 
+        if (req.method === "GET" && url.pathname === "/api/autosync") {
+          sendJson(res, 200, {
+            ok: true,
+            enabled: stopAutoSync !== null,
+            last_run: lastAutoSync,
+          });
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/autosync") {
+          const result = await runAutoSyncNow();
+          sendJson(res, 200, { ok: true, result });
+          return;
+        }
+
         if (req.method === "POST" && url.pathname === "/api/quit") {
           sendJson(res, 200, { ok: true, message: "stopping" });
           res.on("finish", shutdown);
@@ -740,11 +1195,23 @@ export async function handleUiCommand(options: {
   });
   let trayHost: TrayHost | null = null;
   let shuttingDown = false;
+  let stopAutoSync: (() => void) | null = null;
+  let lastAutoSync: AutoSyncRunResult | null = null;
+
+  async function runAutoSyncNow(): Promise<AutoSyncRunResult> {
+    const clientId = await resolveRegistryClientId(store.paths.codexTeamDir);
+    const result = await runAutoSyncOnce({ store, clientId, debugLog: options.debugLog });
+    lastAutoSync = result;
+    return result;
+  }
+
   function shutdown(): void {
     if (shuttingDown) {
       return;
     }
     shuttingDown = true;
+    stopAutoSync?.();
+    accountAddFlows.cancelAll();
     trayHost?.stop();
     server.close(() => resolveClosed?.());
   }
@@ -759,6 +1226,29 @@ export async function handleUiCommand(options: {
   const url = `http://127.0.0.1:${port}/?token=${token}`;
 
   const wantsTray = options.tray === true && isTraySupported();
+
+  // Unattended convergence with the registry: adopt newer remote tokens,
+  // refresh what is due under a server-issued lease, push local-only changes.
+  // Stays off when no registry remote is configured.
+  try {
+    const remotes = await readRemotesFile(store);
+    if (remotes.default_remote && remotes.remotes[remotes.default_remote]) {
+      const clientId = await resolveRegistryClientId(store.paths.codexTeamDir);
+      const autoSyncController = new AbortController();
+      stopAutoSync = () => autoSyncController.abort();
+      void runAutoSyncLoop({
+        store,
+        clientId,
+        signal: autoSyncController.signal,
+        debugLog: options.debugLog,
+        onRun: (result) => {
+          lastAutoSync = result;
+        },
+      });
+    }
+  } catch (error) {
+    options.debugLog?.(`ui: auto-sync disabled: ${(error as Error).message}`);
+  }
 
   process.once("SIGINT", shutdown);
   stdout.write(`codexm 控制台已启动：${url}\n`);

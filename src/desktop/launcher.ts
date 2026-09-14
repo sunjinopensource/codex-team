@@ -736,6 +736,9 @@ export function createCodexDesktopLauncher(options: {
     readManagedCurrentAccount,
     readManagedCurrentQuota,
     refreshManagedAccountSurface,
+    // Windows Desktop ignores --remote-debugging-port, so there is no DevTools
+    // session to hot-apply switches against; restarts carry the new auth there.
+    supportsManagedSwitchHotApply: platform !== "win32",
     applyManagedSwitch,
     watchManagedQuotaSignals,
   };

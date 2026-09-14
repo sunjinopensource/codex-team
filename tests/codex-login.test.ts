@@ -4,8 +4,8 @@ import { PassThrough } from "node:stream";
 
 import { describe, expect, test } from "@rstest/core";
 
-import { createCodexLoginProvider } from "../src/codex-login.js";
-import { createAuthPayload, jsonResponse } from "./test-helpers.js";
+import { createCodexLoginProvider, startCodexDeviceLogin } from "../src/codex-login.js";
+import { createAuthPayload, jsonResponse, textResponse } from "./test-helpers.js";
 
 function captureWritable(): {
   stream: NodeJS.WriteStream;
@@ -207,5 +207,83 @@ describe("Codex login provider", () => {
     ]);
     expect(stdout.read()).toBe("");
     expect(stderr.read()).toContain("ABCD-EFGH");
+  });
+
+  test("starts a device session before the operator approves it", async () => {
+    const auth = createAuthPayload("acct-device-session", "chatgpt", "plus", "user-device-session");
+    let tokenAttempts = 0;
+
+    const fetchMock: typeof fetch = async (input) => {
+      const url = String(input);
+
+      if (url.endsWith("/api/accounts/deviceauth/usercode")) {
+        return jsonResponse({
+          device_auth_id: "device-auth-id",
+          user_code: "WXYZ-1234",
+          interval: "1",
+        });
+      }
+
+      if (url.endsWith("/api/accounts/deviceauth/token")) {
+        tokenAttempts += 1;
+        if (tokenAttempts < 2) {
+          return textResponse("authorization_pending", 403);
+        }
+        return jsonResponse({
+          authorization_code: "authorization-code",
+          code_verifier: "code-verifier",
+        });
+      }
+
+      if (url.endsWith("/oauth/token")) {
+        return jsonResponse({
+          id_token: auth.tokens?.id_token,
+          access_token: auth.tokens?.access_token,
+          refresh_token: auth.tokens?.refresh_token,
+        });
+      }
+
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const session = await startCodexDeviceLogin(fetchMock);
+    expect(session.userCode).toBe("WXYZ-1234");
+    expect(session.verificationUrl).toBe("https://auth.openai.com/codex/device");
+    expect(tokenAttempts).toBe(0);
+
+    const snapshot = await session.wait();
+    expect(snapshot).toMatchObject({
+      auth_mode: "chatgpt",
+      tokens: {
+        account_id: "acct-device-session",
+      },
+    });
+    expect(tokenAttempts).toBe(2);
+  });
+
+  test("cancels a pending device session instead of polling on", async () => {
+    const fetchMock: typeof fetch = async (input) => {
+      const url = String(input);
+
+      if (url.endsWith("/api/accounts/deviceauth/usercode")) {
+        return jsonResponse({
+          device_auth_id: "device-auth-id",
+          user_code: "CANCEL-01",
+          interval: "1",
+        });
+      }
+
+      if (url.endsWith("/api/accounts/deviceauth/token")) {
+        return textResponse("authorization_pending", 403);
+      }
+
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const session = await startCodexDeviceLogin(fetchMock);
+    const waiting = session.wait();
+    setTimeout(() => session.cancel("stopped by test"), 10);
+
+    await expect(waiting).rejects.toThrow("stopped by test");
   });
 });

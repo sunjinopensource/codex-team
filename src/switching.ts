@@ -13,6 +13,8 @@ import {
   isSyntheticProxyRuntimeActive,
   persistProxyUpstreamAccountSelection,
 } from "./proxy/runtime.js";
+import { getPlatform, type CodexmPlatform } from "./platform.js";
+import { restartManagedDesktopSession } from "./desktop/managed-state.js";
 import {
   DEFAULT_MANAGED_DESKTOP_SWITCH_TIMEOUT_MS,
 } from "./desktop/launcher.js";
@@ -150,6 +152,69 @@ function startManagedDesktopWaitReporter(
   };
 }
 
+export type SwitchDesktopRefreshOutcome =
+  | "applied"
+  | "restarted"
+  | "killed"
+  | "none"
+  | "other-running"
+  | "failed";
+
+/**
+ * Hot-apply is unavailable (the launcher reports no DevTools session to drive,
+ * e.g. Windows Desktop). A codexm-managed session is restarted to pick up the
+ * new auth; a Desktop codexm did not start keeps the warn-only contract.
+ */
+async function restartManagedDesktopToApplySwitch(
+  warnings: string[],
+  desktopLauncher: CodexDesktopLauncher,
+  options: {
+    desiredDesktopApiBaseUrl?: string | null;
+    platform: CodexmPlatform;
+  },
+): Promise<SwitchDesktopRefreshOutcome> {
+  let runningApps: Awaited<ReturnType<CodexDesktopLauncher["listRunningApps"]>>;
+  try {
+    runningApps = await desktopLauncher.listRunningApps();
+  } catch {
+    return "none";
+  }
+  if (runningApps.length === 0) {
+    return "none";
+  }
+
+  try {
+    if (await desktopLauncher.isRunningInsideDesktopShell()) {
+      warnings.push(
+        "控制台运行在 Codex Desktop 内部，无法自动重启它来应用新账号。请在外部终端执行 codexm launch。",
+      );
+      return "failed";
+    }
+  } catch {
+    // Keep the inside-Desktop detection best-effort, same as the rest of the flow.
+  }
+
+  const restart = await restartManagedDesktopSession({
+    desktopLauncher,
+    platform: options.platform,
+    desktopApiBaseUrl: options.desiredDesktopApiBaseUrl,
+    allowNonManaged: false,
+  });
+
+  if (restart.outcome === "relaunched" || restart.outcome === "started") {
+    warnings.push(...restart.warnings);
+    return "restarted";
+  }
+  if (restart.outcome === "other-running") {
+    warnings.push(NON_MANAGED_DESKTOP_WARNING_PREFIX);
+    warnings.push(NON_MANAGED_DESKTOP_FOLLOWUP_WARNING);
+    return "other-running";
+  }
+
+  warnings.push(...restart.warnings);
+  return "failed";
+}
+
 export async function refreshManagedDesktopAfterSwitch(
   warnings: string[],
   desktopLauncher: CodexDesktopLauncher,
@@ -162,8 +227,20 @@ export async function refreshManagedDesktopAfterSwitch(
     statusDelayMs?: number;
     statusIntervalMs?: number;
     timeoutMs?: number;
+    /** Override platform detection for tests. */
+    platform?: CodexmPlatform;
   } = {},
-): Promise<"applied" | "killed" | "none" | "other-running" | "failed"> {
+): Promise<SwitchDesktopRefreshOutcome> {
+  // When the launcher cannot hot-apply a switch over DevTools (Windows Desktop
+  // ignores --remote-debugging-port), restart the managed session instead so
+  // the switch still reaches the running app.
+  if (desktopLauncher.supportsManagedSwitchHotApply === false) {
+    return await restartManagedDesktopToApplySwitch(warnings, desktopLauncher, {
+      desiredDesktopApiBaseUrl: options.desiredDesktopApiBaseUrl,
+      platform: options.platform ?? (await getPlatform()),
+    });
+  }
+
   const normalizeDesktopApiBaseUrl = (value: string | null | undefined): string | null => {
     if (typeof value !== "string") {
       return null;

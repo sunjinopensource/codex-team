@@ -4,11 +4,14 @@ Design constraints:
   * stores the EXACT JSON produced by `codexm export` (bundle format untouched)
   * no business logic: validation of the bundle stays in the Node client
   * Bearer token auth, append-only audit log
-  * no lease/lock: last writer wins (see README for the tradeoff)
+  * writes are serialised by a file lock, and a newer token is never rewound
+  * short-lived refresh leases so only one client refreshes an account at a
+    time (see README)
 
 Data layout (<data-dir>/):
   accounts/<name>.json   raw share bundle
   index.json             metadata for listing (never contains tokens)
+  leases.json            in-flight refresh leases (short TTL)
   audit.jsonl            who did what, when
   token.txt              bearer token, generated on first run
 
@@ -26,13 +29,26 @@ Run (prod):
 from __future__ import annotations
 
 import base64
+import calendar
+import contextlib
 import hmac
 import json
 import os
 import re
 import secrets
+import threading
 import time
+import uuid
 from pathlib import Path
+
+try:  # POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+try:  # Windows
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
 
 from flask import Flask, abort, jsonify, request, send_file
 
@@ -44,11 +60,21 @@ ACCOUNTS = DATA / "accounts"
 INDEX = DATA / "index.json"
 AUDIT = DATA / "audit.jsonl"
 TOKEN_FILE = DATA / "token.txt"
+LEASES = DATA / "leases.json"
+LOCK_FILE = DATA / ".lock"
+
+# Refresh leases are short-lived on purpose: they only need to cover the few
+# seconds an OAuth refresh takes. That keeps the server free of heartbeat,
+# takeover and fencing logic — an expired lease simply disappears.
+LEASE_TTL_DEFAULT_MS = 120_000
+LEASE_TTL_MAX_MS = 600_000
 
 # Same pattern the Node client uses for account names (keeps paths safe).
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 ACCOUNTS.mkdir(parents=True, exist_ok=True)
+if not LOCK_FILE.exists():  # msvcrt.locking needs a non-empty region
+    LOCK_FILE.write_text(" ", encoding="utf-8")
 
 
 def now_iso() -> str:
@@ -102,6 +128,75 @@ def save_index(index: dict) -> None:
     tmp = INDEX.with_suffix(".tmp")
     tmp.write_text(json.dumps(index, indent=2), encoding="utf-8")
     os.replace(tmp, INDEX)
+
+
+_thread_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def registry_lock():
+    """Serialise read-modify-write cycles across threads *and* processes.
+
+    Flask's dev server is threaded and gunicorn may run more than one worker,
+    so both an in-process lock and an OS-level file lock are held.
+    """
+    with _thread_lock, LOCK_FILE.open("a+") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def load_leases() -> dict:
+    if not LEASES.exists():
+        return {}
+    try:
+        data = json.loads(LEASES.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_leases(leases: dict) -> None:
+    tmp = LEASES.with_suffix(".tmp")
+    tmp.write_text(json.dumps(leases, indent=2), encoding="utf-8")
+    os.replace(tmp, LEASES)
+
+
+def epoch_to_iso(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def prune_lease(leases: dict, name: str) -> dict | None:
+    """Return the live lease for `name`, dropping it when absent or expired."""
+    lease = leases.get(name)
+    if not isinstance(lease, dict):
+        leases.pop(name, None)
+        return None
+    expires = lease.get("expires_at_epoch")
+    if not isinstance(expires, (int, float)) or expires <= time.time():
+        leases.pop(name, None)
+        return None
+    return lease
+
+
+def exp_rank(value: object) -> float:
+    """Sortable rank for an expiry timestamp; unknown/unparsable sorts lowest."""
+    if not isinstance(value, str) or value == "":
+        return -1.0
+    try:
+        return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, TypeError):
+        return -1.0
 
 
 def jwt_exp_iso(token: object) -> str | None:
@@ -171,12 +266,19 @@ def get_account(name: str):
     if not path.exists():
         return jsonify(error="not found"), 404
 
-    index = load_index()
-    if name in index:
-        index[name]["last_downloaded_at"] = now_iso()
-        save_index(index)
+    version = None
+    with registry_lock():
+        index = load_index()
+        meta = index.get(name)
+        if isinstance(meta, dict):
+            meta["last_downloaded_at"] = now_iso()
+            save_index(index)
+            version = meta.get("version")
     audit("download", name)
-    return send_file(path, mimetype="application/json")
+    response = send_file(path, mimetype="application/json")
+    if isinstance(version, int):
+        response.headers["X-Registry-Version"] = str(version)
+    return response
 
 
 @app.put("/v1/accounts/<name>")
@@ -188,25 +290,157 @@ def put_account(name: str):
         audit("upload", name, ok=False, note="invalid bundle")
         return jsonify(error="invalid bundle: expected kind=auth_bundle"), 400
 
-    tmp = ACCOUNTS / f"{name}.json.tmp"
-    payload = json.dumps(bundle, indent=2)
-    tmp.write_text(payload, encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, ACCOUNTS / f"{name}.json")
+    summary = summarize(bundle)
+    # `--force` maps to this header: overwrite even when the upload is older.
+    forced = request.headers.get("X-Registry-Force", "") == "1"
+    lease_id = request.headers.get("X-Lease-Id") or ""
 
-    index = load_index()
-    index[name] = {
-        **summarize(bundle),
-        "updated_at": now_iso(),
-        "last_downloaded_at": index.get(name, {}).get("last_downloaded_at"),
-        "size": len(payload),
-    }
-    save_index(index)
+    with registry_lock():
+        index = load_index()
+        leases = load_leases()
+        current = index.get(name)
+        current = current if isinstance(current, dict) else None
+
+        lease_ok = False
+        if lease_id:
+            lease = prune_lease(leases, name)
+            lease_ok = bool(lease) and lease.get("lease_id") == lease_id
+            if not lease_ok:
+                audit("upload", name, ok=False, note="invalid or expired lease")
+                return jsonify(
+                    error="stale",
+                    reason="lease_invalid",
+                    name=name,
+                    current=current,
+                ), 409
+
+        # A blind upload could rewind a token another machine just refreshed,
+        # so compare expiries while holding the lock. Leased writers are the
+        # authorised refresher and always win.
+        if (
+            current is not None
+            and not forced
+            and not lease_ok
+            and exp_rank(summary.get("token_expires_at"))
+            < exp_rank(current.get("token_expires_at"))
+        ):
+            audit("upload", name, ok=False, note="stale token rejected")
+            return jsonify(
+                error="stale",
+                reason="registry holds a newer token",
+                name=name,
+                current=current,
+            ), 409
+
+        tmp = ACCOUNTS / f"{name}.json.tmp"
+        payload = json.dumps(bundle, indent=2)
+        tmp.write_text(payload, encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, ACCOUNTS / f"{name}.json")
+
+        previous_version = current.get("version") if current else None
+        version = previous_version + 1 if isinstance(previous_version, int) else 1
+        index[name] = {
+            **summary,
+            "version": version,
+            "updated_at": now_iso(),
+            "last_downloaded_at": (current or {}).get("last_downloaded_at"),
+            "size": len(payload),
+        }
+        save_index(index)
+
+        if lease_ok:
+            # The refresh round-trip is done; release so others can refresh.
+            leases.pop(name, None)
+            save_leases(leases)
+
     audit("upload", name)
-    return jsonify(ok=True, name=name)
+    return jsonify(ok=True, name=name, version=version, **summary)
+
+
+@app.get("/v1/accounts/<name>/lease")
+@app.post("/v1/accounts/<name>/lease")
+def lease_account(name: str):
+    """Short-lived "I am refreshing this account right now" lock.
+
+    Only the holder may upload a refreshed bundle while the lease is live, and
+    a successful upload releases it. There is no heartbeat: an abandoned lease
+    expires on its own, which is safe because refreshes happen at most once a
+    day per account.
+    """
+    if not NAME_RE.match(name):
+        abort(400, description="invalid account name")
+
+    if request.method == "GET":
+        with registry_lock():
+            lease = prune_lease(load_leases(), name)
+        return jsonify(ok=True, name=name, lease=lease)
+
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="invalid body: expected a JSON object"), 400
+
+    action = str(body.get("action") or "acquire")
+    client_id = str(body.get("client_id") or "").strip()
+    if client_id == "" or len(client_id) > 128:
+        return jsonify(error="client_id is required (1-128 chars)"), 400
+
+    ttl_ms = body.get("ttl_ms", LEASE_TTL_DEFAULT_MS)
+    try:
+        ttl_ms = int(ttl_ms)
+    except (TypeError, ValueError):
+        return jsonify(error="ttl_ms must be an integer"), 400
+    ttl_ms = max(1_000, min(ttl_ms, LEASE_TTL_MAX_MS))
+
+    with registry_lock():
+        leases = load_leases()
+        lease = prune_lease(leases, name)
+
+        if action == "release":
+            if lease and lease.get("client_id") == client_id:
+                leases.pop(name, None)
+                save_leases(leases)
+                audit("lease.release", name, note=client_id)
+                return jsonify(ok=True, name=name, released=True)
+            audit("lease.release", name, ok=False, note=client_id)
+            return jsonify(ok=True, name=name, released=False)
+
+        if action not in ("acquire", "renew"):
+            return jsonify(error=f"unknown action: {action}"), 400
+
+        if lease is None or lease.get("client_id") == client_id:
+            lease_id = (lease or {}).get("lease_id") or uuid.uuid4().hex
+            expires = time.time() + ttl_ms / 1000.0
+            leases[name] = {
+                "client_id": client_id,
+                "lease_id": lease_id,
+                "acquired_at": (lease or {}).get("acquired_at") or now_iso(),
+                "expires_at": epoch_to_iso(expires),
+                "expires_at_epoch": expires,
+                "ttl_ms": ttl_ms,
+            }
+            save_leases(leases)
+            audit("lease.acquire", name, note=client_id)
+            return jsonify(
+                ok=True,
+                name=name,
+                granted=True,
+                lease_id=lease_id,
+                expires_at=leases[name]["expires_at"],
+                ttl_ms=ttl_ms,
+            )
+
+        audit("lease.deny", name, ok=False, note=client_id)
+        return jsonify(
+            ok=True,
+            name=name,
+            granted=False,
+            holder=lease.get("client_id"),
+            expires_at=lease.get("expires_at"),
+        )
 
 
 @app.delete("/v1/accounts/<name>")
@@ -217,9 +451,14 @@ def delete_account(name: str):
     if not path.exists():
         return jsonify(error="not found"), 404
     path.unlink()
-    index = load_index()
-    index.pop(name, None)
-    save_index(index)
+    with registry_lock():
+        index = load_index()
+        index.pop(name, None)
+        save_index(index)
+        leases = load_leases()
+        if name in leases:
+            leases.pop(name, None)
+            save_leases(leases)
     audit("delete", name)
     return jsonify(ok=True)
 

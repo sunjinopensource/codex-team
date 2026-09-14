@@ -99,6 +99,14 @@ export interface CodexDesktopLauncher {
   readManagedCurrentAccount(): Promise<RuntimeAccountSnapshot | null>;
   readManagedCurrentQuota(): Promise<RuntimeQuotaSnapshot | null>;
   refreshManagedAccountSurface(): Promise<boolean>;
+  /**
+   * Whether applyManagedSwitch can hot-apply an account switch to the running
+   * session. Windows Desktop ignores --remote-debugging-port, so there is no
+   * DevTools session to drive; launchers that cannot hot-apply report false and
+   * callers restart the managed session instead. Optional for backwards
+   * compatibility with hand-rolled test stubs; missing means "supported".
+   */
+  supportsManagedSwitchHotApply?: boolean;
   applyManagedSwitch(options?: {
     force?: boolean;
     timeoutMs?: number;
