@@ -18,13 +18,46 @@ const AUTH_REFRESH_RETRY_BACKOFF_MS = [
   6 * 60 * 60 * 1_000,
   24 * 60 * 60 * 1_000,
 ];
-const AUTH_REFRESH_REPAIR_ERROR_PATTERNS = [
+/**
+ * Provider errors that mean renewal is impossible and only a fresh login helps.
+ * Surfaces import `findAuthReloginError` instead of re-matching these strings.
+ */
+export const AUTH_RELOGIN_ERROR_PATTERNS = [
   /token_expired/i,
   /refresh token/i,
+  /token refresh failed:\s*40[13]/i,
   /sign(?:ing)? in again/i,
+  /log(?:ging)? in again/i,
+  /session has ended/i,
   /token is expired/i,
   /already been used to generate a new access token/i,
+  /invalid_grant/i,
+  /invalid api key/i,
 ];
+
+const AUTH_REFRESH_REPAIR_ERROR_PATTERNS = AUTH_RELOGIN_ERROR_PATTERNS;
+
+/**
+ * Detects saved auth that can no longer be renewed — whether the failure came
+ * from the auth refresh sweep or from a quota refresh that tried to renew the
+ * token first. Returns the provider error so surfaces can explain the action.
+ */
+export function findAuthReloginError(
+  account: Pick<ManagedAccount, "last_auth_refresh_error" | "quota">,
+): string | null {
+  const candidates = [account.last_auth_refresh_error, account.quota?.error_message];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || candidate.trim() === "") {
+      continue;
+    }
+    if (AUTH_RELOGIN_ERROR_PATTERNS.some((pattern) => pattern.test(candidate))) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
 
 export interface AuthRefreshDecision {
   due: boolean;

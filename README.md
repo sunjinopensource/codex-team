@@ -239,6 +239,10 @@ Switching accounts from the console follows the same contract as `codexm switch`
 
 **Add account** in the console header adds a managed snapshot without touching current auth: pick device-code login to get a code plus the OpenAI authorization page (the console polls until you approve it — works even when the console runs on a remote or headless machine), browser-callback login to open the OpenAI authorization page directly (OpenAI redirects to `localhost:1455` on the machine running codexm, so use it when the console and your browser are on the same machine), or paste an API key. Overwriting an existing name asks for confirmation first.
 
+When OpenAI rejects a saved login for good — an expired or revoked refresh token, a `401` such as "Your session has ended" — the card is marked **Re-login required** and offers a **Re-login** button that runs the same add flow under the same name and overwrites the stale snapshot. Switching to that account is hidden until it works again, because the switch would only put the dead auth in place. The CLI equivalent is `codexm replace <name>`.
+
+Every card has a **⋯** menu in its top-right corner holding **Delete account**. The first click only arms the item (it turns red and reads `Confirm delete <name>`); a second click removes that account's snapshot directory. Closing the menu or waiting 6 seconds disarms it, so a stray click cannot delete anything. Deleting the account codex is currently using is allowed: the copy in `~/.codex/auth.json` keeps working, it simply stops belonging to any managed account, and the console warns you to switch. The CLI equivalent is `codexm remove <name>`.
+
 When you want a real app restart instead of an in-place refresh, use **Restart Desktop** in the console header or the tray menu. It quits Codex Desktop and launches it again so the app re-reads the current auth. If the running Desktop was not started by `codexm launch`, the console asks for confirmation first — closing it can discard unsaved sessions; the tray menu treats the click itself as that confirmation.
 
 ## Shell completion

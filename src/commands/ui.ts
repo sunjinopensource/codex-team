@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AccountStore } from "../account-store/index.js";
 import { ensureAccountName } from "../account-store/storage.js";
 import type { AuthSnapshot } from "../auth-snapshot.js";
-import { runAuthRefreshSweep } from "../auth-refresh.js";
+import { findAuthReloginError, runAuthRefreshSweep } from "../auth-refresh.js";
 import type { CodexLoginProvider } from "../codex-login.js";
 import type { CodexDesktopLauncher } from "../desktop/launcher.js";
 import {
@@ -16,7 +16,12 @@ import { describeDesktopNotFound } from "../desktop/shared.js";
 import { getPlatform, type CodexmPlatform } from "../platform.js";
 import { ensureNotReservedProxyAccountName } from "../proxy/constants.js";
 import { resolveManagedDesktopApiBaseUrl } from "../proxy/runtime.js";
-import { listRemoteAccounts, readRemotesFile, resolveRemote } from "../registry/client.js";
+import {
+  deleteRemoteAccount,
+  listRemoteAccounts,
+  readRemotesFile,
+  resolveRemote,
+} from "../registry/client.js";
 import {
   describeBusySwitchLock,
   refreshManagedDesktopAfterSwitch,
@@ -88,19 +93,44 @@ function renderPage(): string {
   button:active { transform: translateY(1px); }
   button.primary { background: var(--accent); border-color: var(--accent); color: #08101f; font-weight: 600; }
   button:disabled { opacity: .5; cursor: default; }
+  button.danger {
+    background: transparent; border-color: rgba(255,86,86,.45); color: #ff9a9a;
+  }
+  button.danger:hover { border-color: var(--hot); background: rgba(255,86,86,.12); }
+  button.danger.armed { background: var(--hot); border-color: var(--hot); color: #20090a; font-weight: 600; }
   main { padding: 24px 28px 48px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   .card {
     background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
     border: 1px solid var(--line); border-radius: 14px; padding: 18px;
   }
   .card.current { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,140,255,.25); }
-  .card-top { display: flex; align-items: baseline; gap: 10px; }
+  .card-top { display: flex; align-items: baseline; gap: 10px; position: relative; }
   .name { font-size: 16px; font-weight: 650; }
+  .icon-btn {
+    background: transparent; border-color: transparent; color: var(--muted);
+    padding: 0 6px; font-size: 18px; line-height: 1.1; align-self: center;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--line); }
+  .menu {
+    position: absolute; top: 24px; right: 0; z-index: 5; min-width: 148px; padding: 6px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 12px 30px rgba(0,0,0,.5); display: grid; gap: 2px;
+  }
+  .menu.hidden { display: none; }
+  .menu-item {
+    width: 100%; text-align: left; background: transparent; border: none;
+    padding: 8px 10px; border-radius: 7px; font-size: 13px;
+  }
+  .menu-item:hover { background: rgba(91,140,255,.16); }
+  .menu-item.danger { color: #ff9a9a; }
+  .menu-item.danger:hover { background: rgba(255,86,86,.16); }
+  .menu-item.danger.armed { background: var(--hot); color: #20090a; font-weight: 600; }
   .badge {
     font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--line); color: var(--muted); text-transform: uppercase; letter-spacing: .4px;
   }
   .badge.live { color: var(--ok); border-color: rgba(63,185,80,.4); }
+  .badge.hot { color: var(--hot); border-color: rgba(255,86,86,.45); }
   .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
   .meters { margin: 16px 0 14px; display: grid; gap: 12px; }
   .meter-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
@@ -178,7 +208,9 @@ function renderPage(): string {
       <input id="addName" autocomplete="off" placeholder="例如 work-plus">
     </div>
     <div class="field-error" id="addError"></div>
-    <div class="field">
+    <!-- Login is always the browser callback now; device / apikey stay wired up
+         behind addMethod and the server for when they are needed again. -->
+    <div class="field" style="display:none">
       <label for="addMethod">登录方式</label>
       <select id="addMethod">
         <option value="device">设备码登录（推荐）</option>
@@ -286,24 +318,35 @@ function renderPage(): string {
       const five = quota.five_hour || null;
       const week = quota.one_week || null;
       const plan = quota.plan_type || account.auth_mode || "—";
-      const status = quota.available || "unknown";
-      const statusLabel = status === "available" ? "可用" : status === "unknown" ? "未知" : "不可用";
-      const blocked = status !== "available";
+      const status = quota.status || "unknown";
+      const statusLabel = status === "ok" ? "可用" : status === "stale" ? "数据陈旧" :
+        status === "error" ? "不可用" : status === "unsupported" ? "不支持配额" : "未知";
+      const blocked = status === "error" || status === "unsupported";
+      const relogin = !!account.relogin_error;
+      const errorText = relogin ? "登录态已失效，请重新登录" : quota.error_message;
       return '<div class="card' + (account.current ? " current" : "") + '">' +
         '<div class="card-top">' +
           '<div class="name">' + esc(account.name) + '</div>' +
-          '<div class="badge' + (account.current ? " live" : "") + '">' + esc(account.current ? "使用中" : statusLabel) + '</div>' +
+          '<div class="badge' + (relogin ? " hot" : account.current ? " live" : "") + '">' +
+            esc(relogin ? "需要重新登录" : account.current ? "使用中" : statusLabel) + '</div>' +
+          '<div class="spacer"></div>' +
+          '<button class="icon-btn" data-menu="' + esc(account.name) + '" title="更多操作" aria-label="更多操作">⋯</button>' +
+          '<div class="menu hidden">' +
+            '<button class="menu-item danger" data-remove="' + esc(account.name) + '">删除账号</button>' +
+          '</div>' +
         '</div>' +
         '<div class="sub">' + esc(plan) + ' · ' + esc(account.account_id || "无账号 ID") +
-          (blocked && quota.error_message ? " · " + esc(quota.error_message) : "") + '</div>' +
+          (blocked && errorText ? " · " + esc(errorText) : "") + '</div>' +
         '<div class="meters">' +
           meter("5 小时" + (five ? " · " + resetHint(five.reset_at) : ""), five) +
           meter("每周" + (week ? " · " + resetHint(week.reset_at) : ""), week) +
         '</div>' +
         '<div class="card-actions">' +
-          '<button class="primary" data-switch="' + esc(account.name) + '"' + (account.current ? " disabled" : "") + '>' +
-            (account.current ? "使用中" : "切换到此账号") +
-          '</button>' +
+          (relogin
+            ? '<button class="primary" data-relogin="' + esc(account.name) + '">重新登录</button>'
+            : '<button class="primary" data-switch="' + esc(account.name) + '"' + (account.current ? " disabled" : "") + '>' +
+              (account.current ? "使用中" : "切换到此账号") +
+            '</button>') +
         '</div>' +
       '</div>';
     }).join("");
@@ -335,10 +378,89 @@ function renderPage(): string {
     }
   }
 
+  // Deleting a managed account drops its auth snapshot for good, so the first
+  // click only arms the menu item; a second click (or nothing) is what removes it.
+  let armedRemove = null;
+  let armTimer = null;
+  let openMenu = null;
+
+  function disarmRemove() {
+    if (armTimer) {
+      clearTimeout(armTimer);
+      armTimer = null;
+    }
+    if (!armedRemove) return;
+    armedRemove.classList.remove("armed");
+    armedRemove.textContent = "删除账号";
+    armedRemove = null;
+  }
+
+  function armRemove(button, name) {
+    disarmRemove();
+    armedRemove = button;
+    button.classList.add("armed");
+    button.textContent = "确认删除 " + name;
+    armTimer = setTimeout(disarmRemove, 6000);
+  }
+
+  function closeMenu() {
+    disarmRemove();
+    if (!openMenu) return;
+    openMenu.classList.add("hidden");
+    openMenu = null;
+  }
+
+  function toggleMenu(button) {
+    const panel = button.parentElement.querySelector(".menu");
+    if (!panel) return;
+    if (openMenu === panel) {
+      closeMenu();
+      return;
+    }
+    closeMenu();
+    panel.classList.remove("hidden");
+    openMenu = panel;
+  }
+
   grid.addEventListener("click", function (event) {
+    const relogin = event.target.closest("button[data-relogin]");
+    if (relogin) {
+      closeMenu();
+      openAddModal(relogin.getAttribute("data-relogin"));
+      showAddError("该账号的登录态已失效。重新登录会用新的登录态覆盖同名账号。");
+      return;
+    }
+    const menuButton = event.target.closest("button[data-menu]");
+    if (menuButton) {
+      toggleMenu(menuButton);
+      return;
+    }
+    const remove = event.target.closest("button[data-remove]");
+    if (remove) {
+      const name = remove.getAttribute("data-remove");
+      if (armedRemove !== remove) {
+        armRemove(remove, name);
+        return;
+      }
+      disarmRemove();
+      closeMenu();
+      act("/api/accounts/remove", { name: name }, "已删除账号");
+      return;
+    }
+    closeMenu();
     const target = event.target.closest("button[data-switch]");
     if (!target) return;
     act("/api/switch", { name: target.getAttribute("data-switch") }, "已切换");
+  });
+
+  document.addEventListener("click", function (event) {
+    if (!openMenu) return;
+    if (event.target.closest("button[data-menu]") || event.target.closest(".menu")) return;
+    closeMenu();
+  });
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") closeMenu();
   });
 
   async function relaunchDesktop(allowNonManaged) {
@@ -396,6 +518,7 @@ function renderPage(): string {
   const addSubmitBtn = document.getElementById("addSubmitBtn");
   let addPoller = null;
   let addFlowId = "";
+  let addForceOverwrite = false;
 
   function clearAddError() {
     addError.classList.remove("show");
@@ -453,6 +576,37 @@ function renderPage(): string {
     authorizeWindowBlank = false;
   }
 
+  /**
+   * A failed start used to blink the placeholder tab away with no explanation.
+   * The tab is already open, so write the reason into it and leave it alone.
+   */
+  function failAuthorizeWindow(message) {
+    if (!authorizeWindow || authorizeWindow.closed) {
+      authorizeWindow = null;
+      authorizeWindowBlank = false;
+      return false;
+    }
+
+    try {
+      const doc = authorizeWindow.document;
+      doc.title = "登录未能开始";
+      doc.body.textContent = "";
+      const heading = doc.createElement("p");
+      heading.textContent = "登录未能开始，请回到 codexm 控制台查看并重试：";
+      const detail = doc.createElement("pre");
+      detail.style.whiteSpace = "pre-wrap";
+      detail.textContent = message;
+      doc.body.append(heading, detail);
+    } catch {
+      /* cross-origin writes are not fatal */
+    }
+
+    // Keep the tab: it is now the only place showing why nothing happened.
+    authorizeWindow = null;
+    authorizeWindowBlank = false;
+    return true;
+  }
+
   function showAddError(message, target) {
     addError.textContent = message;
     addError.classList.add("show");
@@ -491,10 +645,14 @@ function renderPage(): string {
     addModal.classList.add("hidden");
   }
 
-  function openAddModal() {
-    addName.value = "";
+  function openAddModal(prefillName) {
+    // Re-login is replacing a known account by definition, so the "overwrite
+    // the same name?" prompt is noise — and its native dialog interrupts the
+    // click that opened the authorize tab.
+    addForceOverwrite = typeof prefillName === "string" && prefillName !== "";
+    addName.value = typeof prefillName === "string" ? prefillName : "";
     addKey.value = "";
-    addMethod.value = "device";
+    addMethod.value = "browser";
     addKeyField.style.display = "none";
     addCodeField.style.display = "none";
     addLinkField.style.display = "none";
@@ -513,7 +671,9 @@ function renderPage(): string {
   addName.addEventListener("input", clearAddError);
   addKey.addEventListener("input", clearAddError);
 
-  document.getElementById("addBtn").addEventListener("click", openAddModal);
+  document.getElementById("addBtn").addEventListener("click", function () {
+    openAddModal();
+  });
 
   document.getElementById("addCancelBtn").addEventListener("click", function () {
     if (addFlowId) {
@@ -522,6 +682,25 @@ function renderPage(): string {
     addFlowId = "";
     closeAddModal();
   });
+
+  /**
+   * A fresh login only replaces the auth snapshot; the quota numbers on the card
+   * still belong to the previous session (or to the failure), so refresh just
+   * this account instead of waiting for the next sweep.
+   */
+  async function finishAdd(name, warnings) {
+    await reload();
+    (warnings || []).forEach(function (warning) {
+      toast(warning, "warn");
+    });
+    if (!name) return;
+    try {
+      await api("/api/refresh", "POST", { name: name });
+    } catch {
+      /* the account is saved either way; the next refresh will show it */
+    }
+    await reload();
+  }
 
   async function submitAdd(force) {
     const name = addName.value.trim();
@@ -540,9 +719,9 @@ function renderPage(): string {
     try {
       const payload = await api("/api/accounts/add", "POST", {
         name: name,
-        method: addMethod.value,
+        method: addMethod.value || "browser",
         apiKey: addMethod.value === "apikey" ? addKey.value.trim() : undefined,
-        force: !!force,
+        force: !!force || addForceOverwrite,
       });
 
       if (payload.requires_confirmation) {
@@ -559,7 +738,7 @@ function renderPage(): string {
         toast(payload.message, "good");
         addFlowId = "";
         closeAddModal();
-        await reload();
+        await finishAdd(payload.account ? payload.account.name : "", payload.warnings);
         return;
       }
 
@@ -582,9 +761,10 @@ function renderPage(): string {
       stopAddPoller();
       addPoller = setInterval(pollAdd, 2000);
     } catch (error) {
-      notifyAddError(error.message);
+      const message = error.message;
+      const written = failAuthorizeWindow(message);
+      notifyAddError(written ? message + "（原因也写在刚打开的标签页里）" : message);
       addSubmitBtn.disabled = false;
-      dropAuthorizeWindow();
     }
   }
 
@@ -603,7 +783,7 @@ function renderPage(): string {
         addFlowId = "";
         toast(payload.message, "good");
         closeAddModal();
-        await reload();
+        await finishAdd(payload.account ? payload.account.name : "", payload.warnings);
         return;
       }
 
@@ -612,15 +792,17 @@ function renderPage(): string {
         addFlowId = "";
         addSubmitBtn.disabled = false;
         addSubmitBtn.textContent = "重试";
-        notifyAddError(payload.message);
-        dropAuthorizeWindow();
+        const written = failAuthorizeWindow(payload.message);
+        notifyAddError(written
+          ? payload.message + "（原因也写在打开的标签页里）"
+          : payload.message);
       }
     } catch (error) {
       stopAddPoller();
       addFlowId = "";
       addSubmitBtn.disabled = false;
+      failAuthorizeWindow(error.message);
       notifyAddError(error.message);
-      dropAuthorizeWindow();
     }
   }
 
@@ -695,6 +877,7 @@ async function buildState(store: AccountStore): Promise<Record<string, unknown>>
       current: currentNames.has(account.name),
       updated_at: account.updated_at,
       quota: account.quota,
+      relogin_error: findAuthReloginError(account),
     })),
     current: {
       exists: current.exists,
@@ -971,6 +1154,7 @@ interface AccountAddFlow {
   status: "pending" | "done" | "error";
   message: string;
   account?: UiAddedAccount;
+  warnings?: string[];
   cancel: () => void;
   settled: Promise<void>;
 }
@@ -988,7 +1172,9 @@ export function createAccountAddFlows() {
       name: string;
       cancel: () => void;
       wait: Promise<AuthSnapshot>;
-      complete: (snapshot: AuthSnapshot) => Promise<UiAddedAccount>;
+      complete: (
+        snapshot: AuthSnapshot,
+      ) => Promise<{ account: UiAddedAccount; warnings?: string[] }>;
       debugLog?: DebugLogger;
     }): Promise<AccountAddFlow> {
       const id = randomBytes(8).toString("hex");
@@ -1005,7 +1191,9 @@ export function createAccountAddFlows() {
       flow.settled = options.wait.then(
         async (snapshot) => {
           try {
-            flow.account = await options.complete(snapshot);
+            const completed = await options.complete(snapshot);
+            flow.account = completed.account;
+            flow.warnings = completed.warnings ?? [];
             flow.status = "done";
             flow.message = `已添加账号「${options.name}」。`;
             options.debugLog?.(`ui add: flow ${id} completed for ${options.name}`);
@@ -1054,7 +1242,7 @@ export function createAccountAddFlows() {
 export type AccountAddFlows = ReturnType<typeof createAccountAddFlows>;
 
 export type UiAddAccountResult =
-  | { status: "added"; message: string; account: UiAddedAccount }
+  | { status: "added"; message: string; account: UiAddedAccount; warnings?: string[] }
   | { status: "confirm-overwrite"; message: string }
   | {
       status: "pending";
@@ -1071,6 +1259,72 @@ export type UiAddAccountResult =
       flowId: string;
       authorizeUrl: string;
     };
+
+/**
+ * Drops an account from the registry before its local copy disappears, so the
+ * credentials stop being offered to other machines first.
+ *
+ * Best effort: no registry configured, an unreachable server or a rejected
+ * delete must never block the local removal, so problems come back as warnings.
+ */
+async function deleteAccountFromRegistry(options: {
+  store: AccountStore;
+  name: string;
+  debugLog?: DebugLogger;
+}): Promise<{ deleted: boolean; warnings: string[] }> {
+  let remote;
+  try {
+    remote = await resolveRemote(options.store, null);
+  } catch (error) {
+    options.debugLog?.(`ui remove: no registry configured: ${(error as Error).message}`);
+    return { deleted: false, warnings: [] };
+  }
+
+  try {
+    const remoteAccounts = await listRemoteAccounts(remote.config);
+    if (!remoteAccounts.some((entry) => entry.name === options.name)) {
+      return { deleted: false, warnings: [] };
+    }
+    await deleteRemoteAccount(remote.config, options.name);
+    options.debugLog?.(`ui remove: deleted ${options.name} from registry ${remote.name}`);
+    return { deleted: true, warnings: [] };
+  } catch (error) {
+    const reason = (error as Error).message;
+    options.debugLog?.(`ui remove: registry delete failed for ${options.name}: ${reason}`);
+    return {
+      deleted: false,
+      warnings: [`registry「${remote.name}」上的「${options.name}」未能删除：${reason}`],
+    };
+  }
+}
+
+/**
+ * Converges with the registry right after an add or a remove: adopt newer
+ * tokens, push local-only changes. Skipped silently when no registry is
+ * configured, so a single-machine setup is unaffected.
+ */
+async function syncWithRegistryAfterChange(options: {
+  store: AccountStore;
+  debugLog?: DebugLogger;
+}): Promise<{ synced: boolean; warnings: string[] }> {
+  try {
+    const clientId = await resolveRegistryClientId(options.store.paths.codexTeamDir);
+    const result = await runAutoSyncOnce({
+      store: options.store,
+      clientId,
+      debugLog: options.debugLog,
+    });
+    return {
+      synced: true,
+      warnings: result.accounts
+        .filter((entry) => entry.action === "failed")
+        .map((entry) => `registry 同步：「${entry.name}」失败（${entry.error ?? "未知原因"}）`),
+    };
+  } catch (error) {
+    options.debugLog?.(`ui: registry sync skipped: ${(error as Error).message}`);
+    return { synced: false, warnings: [] };
+  }
+}
 
 /**
  * Adds a managed account from the console: an API key is saved straight away,
@@ -1113,6 +1367,11 @@ export async function performUiAddAccount(options: {
       { force: options.force === true },
     );
     options.debugLog?.(`ui add: saved apikey account ${name}`);
+    const registry = await syncWithRegistryAfterChange({
+      store: options.store,
+      debugLog: options.debugLog,
+    });
+
     return {
       status: "added",
       message: `已添加账号「${name}」（API key）。`,
@@ -1121,17 +1380,28 @@ export async function performUiAddAccount(options: {
         auth_mode: account.auth_mode,
         account_id: account.account_id,
       },
+      warnings: registry.warnings,
     };
   }
 
-  const saveSnapshot = async (snapshot: AuthSnapshot): Promise<UiAddedAccount> => {
+  const saveSnapshot = async (
+    snapshot: AuthSnapshot,
+  ): Promise<{ account: UiAddedAccount; warnings?: string[] }> => {
     const account = await options.store.addAccountSnapshot(name, snapshot, {
       force: options.force === true,
     });
+    const registry = await syncWithRegistryAfterChange({
+      store: options.store,
+      debugLog: options.debugLog,
+    });
+
     return {
-      name: account.name,
-      auth_mode: account.auth_mode,
-      account_id: account.account_id,
+      account: {
+        name: account.name,
+        auth_mode: account.auth_mode,
+        account_id: account.account_id,
+      },
+      warnings: registry.warnings,
     };
   };
 
@@ -1140,7 +1410,17 @@ export async function performUiAddAccount(options: {
       throw new Error("当前控制台没有可用的浏览器回调登录能力，请在终端执行 codexm add。");
     }
 
-    const session = await options.authLogin.startBrowserLogin();
+    let session: Awaited<ReturnType<NonNullable<CodexLoginProvider["startBrowserLogin"]>>>;
+    try {
+      session = await options.authLogin.startBrowserLogin();
+    } catch (error) {
+      const reason = (error as Error).message;
+      options.debugLog?.(`ui add: browser login start failed: ${reason}`);
+      throw new Error(
+        `无法启动浏览器回调登录（回调端口 1455 可能已被占用）：${reason}。可以改用设备码登录。`,
+      );
+    }
+
     const flow = await options.flows.start({
       name,
       wait: session.wait(),
@@ -1178,6 +1458,72 @@ export async function performUiAddAccount(options: {
     flowId: flow.id,
     userCode: session.userCode,
     verificationUrl: session.verificationUrl,
+  };
+}
+
+export interface UiRemoveAccountResult {
+  message: string;
+  warnings: string[];
+}
+
+/**
+ * Removes a managed account from the console. The current auth file is a copy,
+ * so deleting the account that is currently in use does not break codex right
+ * away — it just leaves that copy unmanaged, which is worth saying out loud.
+ */
+export async function performUiRemoveAccount(options: {
+  store: AccountStore;
+  name: string;
+  debugLog?: DebugLogger;
+}): Promise<UiRemoveAccountResult> {
+  const name = options.name.trim();
+  if (name === "") {
+    throw new Error("缺少账号名称");
+  }
+  ensureAccountName(name);
+
+  const current = await options.store.getCurrentStatus();
+  const wasCurrent = current.matched_accounts.includes(name);
+
+  // Registry first: stop offering these credentials to other machines before
+  // the local copy goes away.
+  const registryRemoval = await deleteAccountFromRegistry({
+    store: options.store,
+    name,
+    debugLog: options.debugLog,
+  });
+
+  try {
+    await options.store.removeAccount(name);
+  } catch (error) {
+    const reason = (error as Error).message;
+    options.debugLog?.(`ui remove failed: name=${name} error=${reason}`);
+    throw new Error(`删除账号「${name}」失败：${reason}`);
+  }
+
+  // Sync only after the local delete: converging while the account is still
+  // local would push it straight back and recreate the orphan record.
+  const registrySync = await syncWithRegistryAfterChange({
+    store: options.store,
+    debugLog: options.debugLog,
+  });
+
+  options.debugLog?.(`ui remove: name=${name} wasCurrent=${wasCurrent}`);
+
+  const warnings = [
+    ...registryRemoval.warnings,
+    ...registrySync.warnings,
+  ];
+  if (wasCurrent) {
+    warnings.push(
+      `「${name}」是当前 codex 使用的登录态来源。删除后 ~/.codex/auth.json 仍保留这份登录态副本，但不再属于任何托管账号；建议切换到其他账号。`,
+    );
+  }
+
+  return {
+    message: `已删除账号「${name}」。` +
+      (registryRemoval.deleted ? "已同时从 registry 删除，并立即同步。" : ""),
+    warnings,
   };
 }
 
@@ -1277,6 +1623,22 @@ export async function handleUiCommand(options: {
           return;
         }
 
+        if (req.method === "POST" && url.pathname === "/api/accounts/remove") {
+          const body = await readJsonBody(req);
+          const name = typeof body.name === "string" ? body.name : "";
+          if (name === "") {
+            sendJson(res, 400, { error: "缺少账号名称" });
+            return;
+          }
+          const result = await performUiRemoveAccount({
+            store,
+            name,
+            debugLog: options.debugLog,
+          });
+          sendJson(res, 200, { ok: true, message: result.message, warnings: result.warnings });
+          return;
+        }
+
         if (req.method === "GET" && url.pathname === "/api/accounts/add/status") {
           const flow = accountAddFlows.get(url.searchParams.get("flowId") ?? "");
           if (!flow) {
@@ -1288,6 +1650,7 @@ export async function handleUiCommand(options: {
             status: flow.status,
             message: flow.message,
             account: flow.account ?? null,
+            warnings: flow.warnings ?? [],
           });
           if (flow.status !== "pending") {
             accountAddFlows.remove(flow.id);
@@ -1321,10 +1684,16 @@ export async function handleUiCommand(options: {
         }
 
         if (req.method === "POST" && url.pathname === "/api/refresh") {
-          const sweep = await runAuthRefreshSweep({ store });
+          const refreshBody = await readJsonBody(req);
+          const onlyName = typeof refreshBody.name === "string" ? refreshBody.name.trim() : "";
+          const result = await store.refreshAllQuotas(onlyName === "" ? undefined : onlyName);
           sendJson(res, 200, {
             ok: true,
-            message: formatRefreshMessage(sweep),
+            message: `配额刷新成功 ${result.successes.length} 个，失败 ${result.failures.length} 个。`,
+            warnings: [
+              ...result.warnings,
+              ...result.failures.map((failure) => `${failure.name}: ${failure.error}`),
+            ],
           });
           return;
         }

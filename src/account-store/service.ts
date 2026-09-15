@@ -91,6 +91,20 @@ function quotaHasWindowSnapshot(quota: QuotaSnapshot | null | undefined): quota 
     && (hasQuotaWindowSnapshot(quota.five_hour) || hasQuotaWindowSnapshot(quota.one_week));
 }
 
+/**
+ * Keeps the usage windows — a re-login usually lands on the same account — but
+ * drops the failure recorded against the previous login. Without this the card
+ * keeps asking for a re-login right after one succeeded.
+ */
+function withoutQuotaFailure(quota: QuotaSnapshot): QuotaSnapshot {
+  if (quota.status !== "error" && !quota.error_message) {
+    return quota;
+  }
+
+  const { error_message: _previousError, ...rest } = quota;
+  return { ...rest, status: "stale" };
+}
+
 function toLastGoodQuotaSnapshot(quota: QuotaSnapshot): QuotaSnapshot | null {
   if (!quotaHasWindowSnapshot(quota)) {
     return null;
@@ -343,6 +357,14 @@ export class AccountStore {
         configPath,
         rawConfig === "" || rawConfig.endsWith("\n") ? rawConfig : `${rawConfig}\n`,
       );
+    } else if (normalizedSnapshot.auth_mode === "apikey") {
+      // An apikey account is unusable without a config.toml snapshot — switch,
+      // doctor and export all read it. Keep whatever is already saved (a
+      // re-login must not drop the base_url it was configured with) and only
+      // create an empty placeholder when there is nothing to keep.
+      if (!(await pathExists(configPath))) {
+        await this.repository.ensureEmptyAccountConfigSnapshot(name);
+      }
     } else if (await pathExists(configPath)) {
       await rm(configPath, { force: true });
     }
@@ -354,7 +376,14 @@ export class AccountStore {
       existingMeta?.created_at,
     );
     meta.last_switched_at = existingMeta?.last_switched_at ?? null;
-    meta.quota = existingMeta?.quota ?? meta.quota;
+    // The snapshot is brand new, so any "this login is dead" verdict stored for
+    // the old one is stale evidence: a failed auth refresh and the quota error
+    // that made the card demand a re-login both belong to the previous tokens.
+    meta.last_auth_refresh_at = null;
+    meta.last_auth_refresh_status = null;
+    meta.last_auth_refresh_error = null;
+    meta.auth_refresh_fail_count = 0;
+    meta.quota = withoutQuotaFailure(existingMeta?.quota ?? meta.quota);
     meta.last_good_quota = existingMeta?.last_good_quota ?? meta.last_good_quota;
     await atomicWriteFile(metaPath, stringifyJson(meta));
 
