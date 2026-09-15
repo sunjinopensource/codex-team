@@ -23,6 +23,32 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+<#
+The VBS entry point runs this script with a hidden window, so Write-Host goes
+nowhere and a failed start looks exactly like a successful one. Anything the
+operator has to see comes back as a popup instead.
+#>
+function Show-Popup {
+    param(
+        [string]$Message,
+        [string]$Title = 'codexm 托盘',
+        [int]$Seconds = 0,
+        [int]$Icon = 16
+    )
+
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        [void]$shell.Popup($Message, $Seconds, $Title, $Icon)
+    } catch {
+        # A popup is a courtesy; never let it mask the reason it was shown.
+    }
+}
+
+trap {
+    Show-Popup -Message "codexm 托盘启动失败：$($_.Exception.Message)" -Icon 16
+    exit 1
+}
+
 function Resolve-CliPath {
     param([string]$Explicit)
 
@@ -72,7 +98,11 @@ if (-not $Force) {
         Where-Object { $_.CommandLine -match 'codex-team' -and $_.CommandLine -match 'ui' -and $_.CommandLine -match '--tray' })
 
     if ($existing.Count -gt 0) {
-        Write-Host "已有 codexm 托盘实例在运行（pid：$($existing.ProcessId -join '、')）。加 -Force 可以再起一个。" -ForegroundColor Yellow
+        $message = "已有 codexm 托盘实例在运行（pid：$($existing.ProcessId -join '、')）。加 -Force 可以再起一个。"
+        Write-Host $message -ForegroundColor Yellow
+        # The running instance does not re-announce itself, so the double-click
+        # would be silent. It is already up: just say so.
+        Show-Popup -Message $message -Seconds 8 -Icon 64
         exit 0
     }
 
@@ -81,6 +111,11 @@ if (-not $Force) {
         throw "端口 $Port 已被占用（pid $($busy.OwningProcess)）。换个 -Port，或加 -Force 强制启动。"
     }
 }
+
+# The VBS entry point hides this window, so up to here a double-click showed
+# nothing. Say what is happening (this file is UTF-8 with BOM, so the Chinese
+# survives); it auto-closes instead of delaying the actual start.
+Show-Popup -Message "正在启动 codexm 控制台，托盘区稍后会出现蓝色 C 图标，左键单击即可打开控制台。" -Seconds 3 -Icon 64
 
 $cliPath = Resolve-CliPath $Cli
 $nodePath = Resolve-NodePath $Node
@@ -107,10 +142,20 @@ while ((Get-Date) -lt $deadline) {
 }
 
 if (-not $listener -and $proc.HasExited) {
-    Write-Host "托盘启动失败，错误日志：$errLog" -ForegroundColor Red
+    $detail = "托盘启动失败，日志：$errLog"
+    Write-Host $detail -ForegroundColor Red
     if (Test-Path -LiteralPath $errLog) { Get-Content -LiteralPath $errLog -Tail 20 }
     if (Test-Path -LiteralPath $outLog) { Get-Content -LiteralPath $outLog -Tail 20 }
+    Show-Popup -Message $detail -Icon 16
     exit 1
+}
+
+if (-not $listener) {
+    # Still running but never answered on the port: say so instead of claiming
+    # a start that the operator cannot see.
+    $detail = "等待端口 $Port 就绪超时（20 秒），控制台可能仍在启动。日志：$outLog"
+    Write-Host $detail -ForegroundColor Yellow
+    Show-Popup -Message $detail -Seconds 10 -Icon 48
 }
 
 $url = ''

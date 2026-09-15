@@ -232,7 +232,7 @@ codexm ui --port 8899 --no-open
 codexm ui --tray              # 不打开标签页，改为常驻 Windows 系统托盘
 ```
 
-`--tray` 会让控制台常驻 Windows 系统托盘：左键打开控制台，右键可以选择刷新配额、同步到 registry 或退出。macOS 与 Linux 上会自动退回普通模式。
+`--tray` 会让控制台常驻 Windows 系统托盘：左键打开控制台，右键可以选择刷新配额、同步到 registry 或退出。托盘模式既不弹窗口也不开标签页，所以图标就绪时会主动弹一条气泡提示「已启动」，点气泡等同于点图标打开控制台。macOS 与 Linux 上会自动退回普通模式。
 
 在控制台里切换账号与 `codexm switch` 行为一致：先切换本地 auth，再让由 `codexm launch` 启动的 Desktop 应用新账号——支持原地刷新时就地应用；Windows 上 Codex Desktop 忽略调试端口，无法原地刷新，此时会自动重启受管的 Desktop 会话来应用新账号。不是 codexm 启动的 Codex Desktop 会保留原来的登录态，控制台只给出警告而不会去重启它。开启代理模式时，切换只改动代理上游，请求立即走新账号，不会再尝试刷新 Desktop。
 

@@ -233,7 +233,7 @@ codexm ui --port 8899 --no-open
 codexm ui --tray              # keep it in the Windows system tray instead of opening a tab
 ```
 
-`--tray` keeps the console resident in the Windows system tray: left-click opens the console, right-click offers refresh, sync, and quit. On macOS and Linux it falls back to the normal console.
+`--tray` keeps the console resident in the Windows system tray: left-click opens the console, right-click offers refresh, sync, and quit. A tray-only start opens no window and no tab, so the icon announces itself with a balloon notification — clicking that bubble opens the console too. On macOS and Linux it falls back to the normal console.
 
 Switching accounts from the console follows the same contract as `codexm switch`: local auth moves first, then a Desktop started by `codexm launch` picks up the new account — refreshed in place where DevTools allow it, and on Windows (where Codex Desktop ignores the debugging port) by restarting the codexm-managed session. A Codex Desktop that codexm did not start keeps its previous login state — the console surfaces that as a warning instead of restarting it. While proxy mode is active, a switch only moves the proxy upstream, so requests use the new account immediately and no Desktop refresh is attempted.
 

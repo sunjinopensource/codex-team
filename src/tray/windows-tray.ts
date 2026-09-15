@@ -80,7 +80,17 @@ $notifyIcon.add_Click({
   }
 })
 
+# A tray-only start shows no window and no browser tab, so without this the
+# launch looks like a no-op. Clicking the bubble is the same as clicking the icon.
+$notifyIcon.add_BalloonTipClicked({ Emit 'open' })
+
 Emit 'ready'
+
+$notifyIcon.BalloonTipTitle = 'codexm 控制台已启动'
+$notifyIcon.BalloonTipText = '左键单击图标打开控制台，右键查看更多操作。'
+$notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+$notifyIcon.ShowBalloonTip(8000)
+
 [System.Windows.Forms.Application]::Run()
 $notifyIcon.Visible = $false
 $notifyIcon.Dispose()
