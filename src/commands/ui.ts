@@ -632,6 +632,45 @@ function renderPage(): string {
     showAddError(message, target);
   }
 
+  /**
+   * Once a flow dies, the authorize link still points at the consumed URL and
+   * its callback would hit a missing flowId — drop the block until a retry
+   * produces a fresh link.
+   */
+  function hideStaleAddAuthorizeLink() {
+    addLinkField.style.display = "none";
+  }
+
+  function cancelAddFlow(flowId) {
+    if (!flowId) {
+      return;
+    }
+    api("/api/accounts/add/cancel", "POST", { flowId: flowId }).catch(function () {});
+  }
+
+  /** True once the tab that was supposed to finish the login is gone. */
+  function authorizeTabClosed() {
+    return !!authorizeWindow && authorizeWindow.closed;
+  }
+
+  /**
+   * Closing the authorize tab strands the flow: nobody calls back, so it stays
+   * pending forever and keeps the loopback callback port bound — which makes
+   * the next attempt fail to bind it. End it instead of waiting.
+   */
+  function abandonAddFlow(message) {
+    const flowId = addFlowId;
+    stopAddPoller();
+    addFlowId = "";
+    authorizeWindow = null;
+    authorizeWindowBlank = false;
+    cancelAddFlow(flowId);
+    addSubmitBtn.disabled = false;
+    addSubmitBtn.textContent = "重试";
+    hideStaleAddAuthorizeLink();
+    notifyAddError(message);
+  }
+
   function stopAddPoller() {
     if (addPoller) {
       clearInterval(addPoller);
@@ -676,9 +715,7 @@ function renderPage(): string {
   });
 
   document.getElementById("addCancelBtn").addEventListener("click", function () {
-    if (addFlowId) {
-      api("/api/accounts/add/cancel", "POST", { flowId: addFlowId }).catch(function () {});
-    }
+    cancelAddFlow(addFlowId);
     addFlowId = "";
     closeAddModal();
   });
@@ -763,6 +800,7 @@ function renderPage(): string {
     } catch (error) {
       const message = error.message;
       const written = failAuthorizeWindow(message);
+      hideStaleAddAuthorizeLink();
       notifyAddError(written ? message + "（原因也写在刚打开的标签页里）" : message);
       addSubmitBtn.disabled = false;
     }
@@ -792,15 +830,24 @@ function renderPage(): string {
         addFlowId = "";
         addSubmitBtn.disabled = false;
         addSubmitBtn.textContent = "重试";
+        // The flow is dead on the server; the link still points at the old
+        // authorize URL, whose callback would land on a missing flowId.
+        hideStaleAddAuthorizeLink();
         const written = failAuthorizeWindow(payload.message);
         notifyAddError(written
           ? payload.message + "（原因也写在打开的标签页里）"
           : payload.message);
+        return;
+      }
+
+      if (payload.status === "pending" && authorizeTabClosed()) {
+        abandonAddFlow("授权页面已关闭，登录流程已取消。点「重试」重新打开授权页面。");
       }
     } catch (error) {
       stopAddPoller();
       addFlowId = "";
       addSubmitBtn.disabled = false;
+      hideStaleAddAuthorizeLink();
       failAuthorizeWindow(error.message);
       notifyAddError(error.message);
     }

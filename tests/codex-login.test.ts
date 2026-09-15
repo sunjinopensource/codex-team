@@ -360,4 +360,19 @@ describe("Codex login provider", () => {
     restarted.cancel("cleanup");
     await expect(restarted.wait()).rejects.toThrow("cleanup");
   });
+
+  test("gives up on a browser login nobody completes, and frees the port", async () => {
+    const fetchMock: typeof fetch = async () => jsonResponse({});
+    const port = await reserveLoopbackPort();
+
+    // A closed authorize tab never calls back; without a deadline the console
+    // keeps the loopback listener bound and the next login cannot bind it.
+    const session = await startCodexBrowserLogin(fetchMock, { port, timeoutMs: 20 });
+
+    await expect(session.wait()).rejects.toThrow("timed out");
+
+    const restarted = await startCodexBrowserLogin(fetchMock, { port, timeoutMs: 20 });
+    restarted.cancel("cleanup");
+    await expect(restarted.wait()).rejects.toThrow("cleanup");
+  });
 });

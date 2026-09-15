@@ -14,6 +14,7 @@ const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_ORIGINATOR = "codex_cli_rs";
 const CODEX_LOGIN_PORT = 1455;
 const DEVICE_LOGIN_TIMEOUT_MS = 15 * 60 * 1000;
+const BROWSER_LOGIN_TIMEOUT_MS = 15 * 60 * 1000;
 
 export type CodexLoginMode = "browser" | "device";
 
@@ -355,9 +356,11 @@ export async function startCodexBrowserLogin(
     stderr?: NodeJS.WriteStream;
     openBrowser?: boolean;
     spawnImpl?: SpawnLike;
+    timeoutMs?: number;
   } = {},
 ): Promise<CodexBrowserLoginSession> {
   const port = options.port ?? CODEX_LOGIN_PORT;
+  const timeoutMs = options.timeoutMs ?? BROWSER_LOGIN_TIMEOUT_MS;
   const state = generateBase64Url(32);
   const pkce = generatePkceCodes();
   const redirectUri = `http://localhost:${port}/auth/callback`;
@@ -384,6 +387,28 @@ export async function startCodexBrowserLogin(
 
   const cancelListeners = new Set<(error: Error) => void>();
   let cancellation: Error | null = null;
+  let timeout: NodeJS.Timeout | null = null;
+
+  /**
+   * Abandoned browser logins used to hold the loopback callback listener
+   * forever — nobody calls back when the tab is closed, and a long-lived host
+   * (the console) would keep the port bound until it restarted.
+   */
+  const endSession = (reason: string): void => {
+    if (cancellation) {
+      return;
+    }
+    cancellation = new Error(reason);
+    if (timeout) {
+      clearTimeout(timeout);
+      timeout = null;
+    }
+    server.close();
+    for (const listener of cancelListeners) {
+      listener(cancellation);
+    }
+    cancelListeners.clear();
+  };
 
   return {
     authorizeUrl,
@@ -393,35 +418,40 @@ export async function startCodexBrowserLogin(
         throw cancellation;
       }
 
-      const { result } = await Promise.race([
-        server.result,
-        new Promise<never>((_, reject) => {
-          if (cancellation) {
-            reject(cancellation);
-            return;
-          }
-          cancelListeners.add(reject);
-        }),
-      ]);
+      timeout = setTimeout(() => {
+        endSession("Codex browser login timed out with no callback.");
+      }, timeoutMs);
+      // A pending timeout must not keep a short-lived process alive.
+      timeout.unref?.();
 
-      const tokens = await exchangeCodeForTokens(
-        fetchImpl,
-        result.code,
-        redirectUri,
-        pkce.codeVerifier,
-      );
-      return authSnapshotFromTokens(tokens);
+      try {
+        const { result } = await Promise.race([
+          server.result,
+          new Promise<never>((_, reject) => {
+            if (cancellation) {
+              reject(cancellation);
+              return;
+            }
+            cancelListeners.add(reject);
+          }),
+        ]);
+
+        const tokens = await exchangeCodeForTokens(
+          fetchImpl,
+          result.code,
+          redirectUri,
+          pkce.codeVerifier,
+        );
+        return authSnapshotFromTokens(tokens);
+      } finally {
+        if (timeout) {
+          clearTimeout(timeout);
+          timeout = null;
+        }
+      }
     },
     cancel: (reason?: string) => {
-      if (cancellation) {
-        return;
-      }
-      cancellation = new Error(reason ?? "Codex browser login was cancelled.");
-      server.close();
-      for (const listener of cancelListeners) {
-        listener(cancellation);
-      }
-      cancelListeners.clear();
+      endSession(reason ?? "Codex browser login was cancelled.");
     },
   };
 }
